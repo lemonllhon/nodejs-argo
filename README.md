@@ -48,9 +48,9 @@ Telegram交流反馈群组：https://t.me/eooceu
 | TEAMNODE_SYNC_BASE_URL | 否 | `https://teamnode.lemon.vin` | TeamNode 地址 |
 | TEAMNODE_SYNC_KEY_ID | 否 | `nodejs-argo-prod` | TeamNode 内部同步 Key ID |
 | TEAMNODE_SYNC_SECRET | 否 | - | TeamNode 内部同步签名密钥 |
-| TEAMNODE_SYNC_GROUP_KEY | 否 | argo-auto | TeamNode 节点分组 Key |
-| TEAMNODE_SYNC_PROVIDER | 否 | nodejs-argo | TeamNode 节点供应商标识 |
-| TEAMNODE_SYNC_LABEL_PREFIX | 否 | NAME 或 Argo | TeamNode 节点标签前缀 |
+| TEAMNODE_SYNC_GROUP_KEY | 否 | basic | TeamNode 节点分组 Key |
+| TEAMNODE_SYNC_PROVIDER | 否 | 自动生成 | TeamNode 节点供应商标识，默认按国家/地区缩写自动生成，如 `us`、`sin` |
+| TEAMNODE_SYNC_LABEL_PREFIX | 否 | 空 | TeamNode 节点标签前缀，默认直接使用国家名作为节点名称 |
 | TEAMNODE_SYNC_TIMEOUT_MS | 否 | 10000 | TeamNode 同步请求超时 |
 | TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS | 否 | 300000 | TeamNode 心跳间隔（毫秒） |
 
@@ -65,18 +65,27 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 - 向 TeamNode 注册节点
 - 定时向 TeamNode 发送心跳
+- 在 `SIGINT / SIGTERM` 时 best-effort 发送下线通知
 - 保持原有 `UPLOAD_URL` 逻辑兼容
 
 如果你使用默认 TeamNode：
 
 - `TEAMNODE_SYNC_BASE_URL=https://teamnode.lemon.vin`
 - `TEAMNODE_SYNC_KEY_ID=nodejs-argo-prod`
+- `TEAMNODE_SYNC_GROUP_KEY=basic`
 
 那么部署时通常只需要配置：
 
 ```bash
 TEAMNODE_SYNC_SECRET=你的签名密钥
 ```
+
+注意：
+
+- `TEAMNODE_SYNC_SECRET` 必须是专门给 `nodejs-argo` 使用的一组独立签名密钥
+- 代码内不再内置默认签名密钥；未配置时不会自动同步到 TeamNode
+- 默认节点名称会自动使用部署地国家名，例如 `美国`、`韩国`、`新加坡`
+- 默认供应商会自动使用国家/地区缩写，例如 `us`、`kr`、`sin`
 
 详细说明见：`docs/TeamNode同步接入.md`
 

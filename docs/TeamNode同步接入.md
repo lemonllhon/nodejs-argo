@@ -6,6 +6,7 @@
 
 - 自动向 TeamNode 注册节点
 - 定时向 TeamNode 发送心跳
+- 进程退出时主动向 TeamNode 发送下线通知
 - 保持旧 `UPLOAD_URL` 上传逻辑兼容
 - 未配置 TeamNode 同步参数时，按原模式运行
 
@@ -25,12 +26,12 @@
 | `TEAMNODE_SYNC_ENABLED` | 否 | 自动推断 | 是否启用 TeamNode 同步；默认只要存在 `TEAMNODE_SYNC_SECRET` 就会自动启用 |
 | `TEAMNODE_SYNC_BASE_URL` | 否 | `https://teamnode.lemon.vin` | TeamNode 基础地址 |
 | `TEAMNODE_SYNC_KEY_ID` | 否 | `nodejs-argo-prod` | TeamNode 内部同步 Key ID |
-| `TEAMNODE_SYNC_SECRET` | 否 | - | TeamNode 内部同步签名密钥 |
+| `TEAMNODE_SYNC_SECRET` | 否 | - | TeamNode 内部同步签名密钥；必须单独配置，不复用其他同步通道密钥 |
 | `TEAMNODE_SYNC_TIMEOUT_MS` | 否 | `10000` | 单次请求超时 |
 | `TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS` | 否 | `300000` | 心跳间隔，默认 5 分钟 |
-| `TEAMNODE_SYNC_GROUP_KEY` | 否 | `argo-auto` | TeamNode 节点分组 Key |
-| `TEAMNODE_SYNC_PROVIDER` | 否 | `nodejs-argo` | TeamNode 供应商标识 |
-| `TEAMNODE_SYNC_LABEL_PREFIX` | 否 | `NAME` 或 `Argo` | TeamNode 节点标签前缀 |
+| `TEAMNODE_SYNC_GROUP_KEY` | 否 | `basic` | TeamNode 节点分组 Key |
+| `TEAMNODE_SYNC_PROVIDER` | 否 | 自动生成 | TeamNode 供应商标识；默认按国家/地区缩写自动生成，如 `us`、`sin` |
+| `TEAMNODE_SYNC_LABEL_PREFIX` | 否 | 空 | TeamNode 节点标签前缀；默认直接使用国家名作为节点名称 |
 
 ## 4. 上报数据
 
@@ -63,6 +64,12 @@
 - `bootId`
 - `metadata`
 
+主动下线时会上报：
+
+- `uuid`
+- `argoDomain`
+- `reason`
+
 ## 5. 运行逻辑
 
 1. `nodejs-argo` 启动并生成订阅
@@ -70,6 +77,7 @@
 3. 注册成功后，启动定时心跳
 4. 若注册失败，不影响原有服务继续运行，只记录日志
 5. 若心跳返回“来源不存在”，下一个周期会自动重新注册
+6. 收到 `SIGINT / SIGTERM` 时，会 best-effort 发送一次下线通知
 
 ### 5.1 推荐的最简部署方式
 
@@ -77,16 +85,25 @@
 
 - `TEAMNODE_SYNC_BASE_URL=https://teamnode.lemon.vin`
 - `TEAMNODE_SYNC_KEY_ID=nodejs-argo-prod`
-- `TEAMNODE_SYNC_GROUP_KEY=argo-auto`
-- `TEAMNODE_SYNC_PROVIDER=nodejs-argo`
+- `TEAMNODE_SYNC_GROUP_KEY=basic`
 - `TEAMNODE_SYNC_TIMEOUT_MS=10000`
 - `TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS=300000`
+
+同时会自动生成：
+
+- 默认节点名称：部署地国家名，例如 `美国`、`韩国`、`新加坡`、`日本`、`德国`
+- 默认供应商：国家/地区缩写，例如 `us`、`kr`、`sin`、`jp`、`de`
 
 因此多数部署场景只需要配置：
 
 ```bash
 TEAMNODE_SYNC_SECRET=你的签名密钥
 ```
+
+注意：
+
+- 这个密钥应当是专门给 `nodejs-argo -> TeamNode` 使用的一组新密钥
+- 代码内不再内置默认签名密钥，未配置时不会自动同步
 
 如需覆盖默认行为，再单独传入对应环境变量即可。
 
@@ -103,6 +120,5 @@ TEAMNODE_SYNC_SECRET=你的签名密钥
 
 - 签名注册
 - 定时心跳
+- 主动下线通知
 - 启动后自动接入
-
-后续如需“主动下线通知”，需要在 TeamNode 侧先提供对应接口后再补充。

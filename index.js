@@ -25,12 +25,13 @@ const CFPORT = process.env.CFPORT || 443; // 节点优选域名或优选 IP 对�
 const NAME = process.env.NAME || ""; // 节点名称前缀
 const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
 const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
-const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "Zmd2cmZnZ3JoZnJlZ3RyaHRqZ2RmZXJ3Z3JldGh1eWtpaw==";
-const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "argo-auto";
-const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "nodejs-argo";
-const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || NAME || "Argo";
+const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "";
+const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "basic";
+const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "";
+const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
 const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
+const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -66,7 +67,12 @@ const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
 let teamnodeSyncTimer = null;
 let teamnodeSyncRegistered = false;
 let teamnodeSyncContext = null;
+let teamnodeShutdownPromise = null;
+let processShutdownRequested = false;
 let bootInstanceId = createRandomToken();
+const PROVIDER_CODE_OVERRIDES = {
+  SG: "sin"
+};
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
@@ -150,9 +156,57 @@ function isTeamNodeSyncConfigured() {
   );
 }
 
-function buildTeamNodeLabel(nodeName, argoDomain) {
-  const prefix = String(TEAMNODE_SYNC_LABEL_PREFIX || "Argo").trim() || "Argo";
-  const suffix = String(nodeName || argoDomain || "node").trim();
+function normalizeCountryCode(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function resolveCountryLabel(meta = {}) {
+  const countryCode = normalizeCountryCode(meta.countryCode);
+  if (countryCode && typeof Intl !== "undefined" && typeof Intl.DisplayNames === "function") {
+    try {
+      const displayNames = new Intl.DisplayNames(["zh-CN"], { type: "region" });
+      const localized = String(displayNames.of(countryCode) || "").trim();
+      if (localized && localized.toLowerCase() !== countryCode.toLowerCase()) {
+        return localized;
+      }
+    } catch {
+      // Ignore locale lookup failures and fall back to API text.
+    }
+  }
+
+  const countryName = String(meta.countryName || "").trim();
+  if (countryName && !/^unknown$/i.test(countryName)) {
+    return countryName;
+  }
+
+  return countryCode || "未知地区";
+}
+
+function resolveTeamNodeProvider(meta = {}) {
+  const configured = String(TEAMNODE_SYNC_PROVIDER || "").trim().toLowerCase();
+  if (configured) {
+    return configured;
+  }
+
+  const countryCode = normalizeCountryCode(meta.countryCode);
+  if (!countryCode || /^unknown$/i.test(countryCode)) {
+    return "auto";
+  }
+
+  return String(PROVIDER_CODE_OVERRIDES[countryCode] || countryCode).trim().toLowerCase() || "auto";
+}
+
+function buildDefaultNodeName(meta = {}) {
+  const nodeSuffix = String(resolveCountryLabel(meta) || meta.display || "Unknown").trim() || "Unknown";
+  return NAME ? `${NAME}-${nodeSuffix}` : nodeSuffix;
+}
+
+function buildTeamNodeLabel(nodeName, argoDomain, meta = {}) {
+  const prefix = String(TEAMNODE_SYNC_LABEL_PREFIX || "").trim();
+  const suffix = String(nodeName || resolveCountryLabel(meta) || argoDomain || "node").trim();
+  if (!prefix) {
+    return suffix.slice(0, 128);
+  }
   if (suffix.toLowerCase().startsWith(`${prefix.toLowerCase()}-`)) {
     return suffix.slice(0, 128);
   }
@@ -188,8 +242,8 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
 
   const payload = {
     groupKey: TEAMNODE_SYNC_GROUP_KEY,
-    label: buildTeamNodeLabel(context.nodeName, context.argoDomain),
-    provider: TEAMNODE_SYNC_PROVIDER,
+    label: buildTeamNodeLabel(context.nodeName, context.argoDomain, context.meta),
+    provider: resolveTeamNodeProvider(context.meta),
     uuid: UUID,
     argoDomain: context.argoDomain,
     projectUrl: PROJECT_URL || null,
@@ -252,6 +306,35 @@ async function syncNodeHeartbeatToTeamNode(context) {
   }
 }
 
+async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
+  if (!isTeamNodeSyncConfigured() || !context || !teamnodeSyncRegistered) return null;
+
+  const payload = {
+    uuid: UUID,
+    argoDomain: context.argoDomain,
+    reason: String(reason || "process_shutdown").trim() || "process_shutdown"
+  };
+
+  if (!payload.argoDomain) return null;
+
+  try {
+    const response = await postTeamNodeSync("/api/internal/nodejs-argo/offline", payload, "nodejs_argo_offline");
+    if (response && response.status === 200) {
+      teamnodeSyncRegistered = false;
+      console.log("TeamNode 下线通知成功");
+      return response.data || null;
+    }
+    return null;
+  } catch (error) {
+    if (error?.response?.status === 404) {
+      teamnodeSyncRegistered = false;
+      console.log("TeamNode 未找到来源节点，跳过下线通知");
+      return null;
+    }
+    throw error;
+  }
+}
+
 async function syncNodeToTeamNode(context) {
   if (!isTeamNodeSyncConfigured()) {
     return null;
@@ -292,6 +375,37 @@ function startTeamNodeHeartbeatLoop(context) {
     if (!teamnodeSyncContext) return;
     syncNodeToTeamNode(teamnodeSyncContext).catch(() => null);
   }, intervalMs);
+}
+
+async function shutdownTeamNodeSync(reason = "process_shutdown") {
+  if (teamnodeShutdownPromise) {
+    return teamnodeShutdownPromise;
+  }
+
+  stopTeamNodeHeartbeatLoop();
+
+  teamnodeShutdownPromise = (async () => {
+    try {
+      if (!teamnodeSyncContext || !teamnodeSyncRegistered || !isTeamNodeSyncConfigured()) {
+        return null;
+      }
+
+      return await Promise.race([
+        syncNodeOfflineToTeamNode(teamnodeSyncContext, reason),
+        new Promise((resolve) => setTimeout(() => resolve(null), TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS))
+      ]);
+    } catch (error) {
+      const status = error?.response?.status ? ` (HTTP ${error.response.status})` : "";
+      const message = error?.response?.data?.error || error?.message || "unknown_error";
+      console.error(`TeamNode 下线通知失败${status}: ${message}`);
+      return null;
+    } finally {
+      teamnodeSyncRegistered = false;
+      teamnodeSyncContext = null;
+    }
+  })();
+
+  return teamnodeShutdownPromise;
 }
 
 // 如果订阅器里存在历史节点，先删除旧节点
@@ -670,8 +784,7 @@ async function getMetaInfo() {
 // 生成 list 和 sub 订阅内容
 async function generateLinks(argoDomain) {
   const metaInfo = await getMetaInfo();
-  const metaDisplay = metaInfo.display || "Unknown";
-  const nodeName = NAME ? `${NAME}-${metaDisplay}` : metaDisplay;
+  const nodeName = buildDefaultNodeName(metaInfo);
 
   return new Promise((resolve) => {
     setTimeout(() => {
@@ -844,14 +957,25 @@ async function startserver() {
   }
 }
 
+function handleProcessShutdownSignal(signal) {
+  if (processShutdownRequested) {
+    return;
+  }
+
+  processShutdownRequested = true;
+  shutdownTeamNodeSync(`signal_${String(signal || "shutdown").toLowerCase()}`)
+    .catch(() => null)
+    .finally(() => {
+      process.exit(0);
+    });
+}
+
 process.on("SIGINT", () => {
-  stopTeamNodeHeartbeatLoop();
-  process.exit(0);
+  handleProcessShutdownSignal("SIGINT");
 });
 
 process.on("SIGTERM", () => {
-  stopTeamNodeHeartbeatLoop();
-  process.exit(0);
+  handleProcessShutdownSignal("SIGTERM");
 });
 
 if (require.main === module) {
@@ -862,10 +986,15 @@ if (require.main === module) {
 
 module.exports = {
   createTeamNodeSyncHeaders,
+  resolveCountryLabel,
+  resolveTeamNodeProvider,
+  buildDefaultNodeName,
   buildTeamNodePayload,
   syncNodeToTeamNode,
   syncNodeRegistrationToTeamNode,
   syncNodeHeartbeatToTeamNode,
+  syncNodeOfflineToTeamNode,
+  shutdownTeamNodeSync,
   startTeamNodeHeartbeatLoop,
   stopTeamNodeHeartbeatLoop,
   getMetaInfo
