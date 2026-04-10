@@ -25,7 +25,7 @@ const CFPORT = process.env.CFPORT || 443; // 节点优选域名或优选 IP 对�
 const NAME = process.env.NAME || ""; // 节点名称前缀
 const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
 const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
-const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "";
+const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "Zmd2cmZnZ3JoZnJlZ3RyaHRqZ2RmZXJ3Z3JldGh1eWtpaw==";
 const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "argo-auto";
 const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "nodejs-argo";
 const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || NAME || "Argo";
