@@ -1,6 +1,7 @@
 ﻿const express = require("express");
 const app = express();
 const axios = require("axios");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { promisify } = require("util");
@@ -22,6 +23,14 @@ const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 
 const CFIP = process.env.CFIP || "cdst.lemon.vin"; // 节点优选域名或优选 IP
 const CFPORT = process.env.CFPORT || 443; // 节点优选域名或优选 IP 对应端口
 const NAME = process.env.NAME || ""; // 节点名称前缀
+const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
+const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
+const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "";
+const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "argo-auto";
+const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "nodejs-argo";
+const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || NAME || "Argo";
+const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
+const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -53,6 +62,237 @@ const configPath = path.join(FILE_PATH, "config.json");
 const nezhaConfigPath = path.join(FILE_PATH, "config.yaml");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
+
+let teamnodeSyncTimer = null;
+let teamnodeSyncRegistered = false;
+let teamnodeSyncContext = null;
+let bootInstanceId = createRandomToken();
+
+function parseBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+const TEAMNODE_SYNC_ENABLED = parseBoolean(
+  process.env.TEAMNODE_SYNC_ENABLED,
+  Boolean(TEAMNODE_SYNC_SECRET)
+);
+
+function normalizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function normalizeRequestPath(value) {
+  const raw = String(value || "/").trim() || "/";
+  const withoutQuery = raw.split("?")[0] || "/";
+  const collapsed = withoutQuery.replace(/\/{2,}/g, "/");
+  if (collapsed.length > 1 && collapsed.endsWith("/")) {
+    return collapsed.slice(0, -1);
+  }
+  return collapsed || "/";
+}
+
+function sha256Hex(value = "") {
+  return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+
+function createRandomToken() {
+  if (typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function createTeamNodeSyncHeaders({ method = "GET", path: requestPath = "/", rawBody = "", eventPrefix = "nodejs_argo" }) {
+  const timestamp = Date.now().toString();
+  const nonce = createRandomToken();
+  const eventId = `${eventPrefix}_${createRandomToken().replace(/-/g, "")}`;
+  const normalizedMethod = String(method || "GET").trim().toUpperCase();
+  const normalizedPath = normalizeRequestPath(requestPath);
+  const signaturePayload = [
+    normalizedMethod,
+    normalizedPath,
+    sha256Hex(rawBody),
+    timestamp,
+    nonce,
+    eventId
+  ].join("\n");
+  const signature = crypto
+    .createHmac("sha256", String(TEAMNODE_SYNC_SECRET || ""))
+    .update(signaturePayload, "utf8")
+    .digest("hex");
+
+  return {
+    eventId,
+    nonce,
+    timestamp,
+    signature,
+    headers: {
+      "x-sync-key-id": TEAMNODE_SYNC_KEY_ID,
+      "x-sync-timestamp": timestamp,
+      "x-sync-nonce": nonce,
+      "x-event-id": eventId,
+      "x-sync-signature": signature
+    }
+  };
+}
+
+function isTeamNodeSyncConfigured() {
+  return Boolean(
+    TEAMNODE_SYNC_ENABLED
+    && normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL)
+    && TEAMNODE_SYNC_KEY_ID
+    && TEAMNODE_SYNC_SECRET
+  );
+}
+
+function buildTeamNodeLabel(nodeName, argoDomain) {
+  const prefix = String(TEAMNODE_SYNC_LABEL_PREFIX || "Argo").trim() || "Argo";
+  const suffix = String(nodeName || argoDomain || "node").trim();
+  if (suffix.toLowerCase().startsWith(`${prefix.toLowerCase()}-`)) {
+    return suffix.slice(0, 128);
+  }
+  return `${prefix}-${suffix}`.slice(0, 128);
+}
+
+async function postTeamNodeSync(relativePath, payload, eventPrefix) {
+  const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
+  if (!baseUrl) return null;
+
+  const requestUrl = new URL(relativePath, `${baseUrl}/`);
+  const rawBody = JSON.stringify(payload || {});
+  const { headers } = createTeamNodeSyncHeaders({
+    method: "POST",
+    path: requestUrl.pathname,
+    rawBody,
+    eventPrefix
+  });
+
+  return axios.post(requestUrl.toString(), payload, {
+    headers: {
+      "Content-Type": "application/json",
+      ...headers
+    },
+    timeout: Number.isFinite(TEAMNODE_SYNC_TIMEOUT_MS) && TEAMNODE_SYNC_TIMEOUT_MS > 0
+      ? TEAMNODE_SYNC_TIMEOUT_MS
+      : 10000
+  });
+}
+
+function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = "starting" } = {}) {
+  if (!context || !context.argoDomain) return null;
+
+  const payload = {
+    groupKey: TEAMNODE_SYNC_GROUP_KEY,
+    label: buildTeamNodeLabel(context.nodeName, context.argoDomain),
+    provider: TEAMNODE_SYNC_PROVIDER,
+    uuid: UUID,
+    argoDomain: context.argoDomain,
+    projectUrl: PROJECT_URL || null,
+    subPath: SUB_PATH || null,
+    runtimeStatus,
+    countryCode: context.meta?.countryCode || null,
+    countryName: context.meta?.countryName || null,
+    ispName: context.meta?.ispName || null,
+    bootId: bootInstanceId,
+    metadata: {
+      cfip: CFIP,
+      cfport: CFPORT,
+      nodeName: context.nodeName || "",
+      projectUrl: PROJECT_URL || "",
+      subPath: SUB_PATH || ""
+    }
+  };
+
+  if (includeContent) {
+    payload.contentBase64 = context.contentBase64 || null;
+  }
+
+  return payload;
+}
+
+async function syncNodeRegistrationToTeamNode(context) {
+  if (!isTeamNodeSyncConfigured() || !context) return null;
+  const payload = buildTeamNodePayload(context, { includeContent: true, runtimeStatus: "starting" });
+  if (!payload) return null;
+
+  const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload, "nodejs_argo_register");
+  if (response && response.status === 200) {
+    teamnodeSyncRegistered = true;
+    console.log("TeamNode 注册成功");
+    return response.data || null;
+  }
+  return null;
+}
+
+async function syncNodeHeartbeatToTeamNode(context) {
+  if (!isTeamNodeSyncConfigured() || !context) return null;
+  const payload = buildTeamNodePayload(context, { includeContent: false, runtimeStatus: "running" });
+  if (!payload) return null;
+
+  try {
+    const response = await postTeamNodeSync("/api/internal/nodejs-argo/heartbeats", payload, "nodejs_argo_heartbeat");
+    if (response && response.status === 200) {
+      teamnodeSyncRegistered = true;
+      console.log("TeamNode 心跳成功");
+      return response.data || null;
+    }
+    return null;
+  } catch (error) {
+    if (error?.response?.status === 404) {
+      teamnodeSyncRegistered = false;
+      console.log("TeamNode 未找到来源节点，自动重新注册");
+      return syncNodeRegistrationToTeamNode(context);
+    }
+    throw error;
+  }
+}
+
+async function syncNodeToTeamNode(context) {
+  if (!isTeamNodeSyncConfigured()) {
+    return null;
+  }
+
+  teamnodeSyncContext = context;
+
+  try {
+    return teamnodeSyncRegistered
+      ? await syncNodeHeartbeatToTeamNode(context)
+      : await syncNodeRegistrationToTeamNode(context);
+  } catch (error) {
+    const status = error?.response?.status ? ` (HTTP ${error.response.status})` : "";
+    const message = error?.response?.data?.error || error?.message || "unknown_error";
+    console.error(`TeamNode 同步失败${status}: ${message}`);
+    return null;
+  }
+}
+
+function stopTeamNodeHeartbeatLoop() {
+  if (teamnodeSyncTimer) {
+    clearInterval(teamnodeSyncTimer);
+    teamnodeSyncTimer = null;
+  }
+}
+
+function startTeamNodeHeartbeatLoop(context) {
+  if (!isTeamNodeSyncConfigured() || !context) return;
+
+  teamnodeSyncContext = context;
+  stopTeamNodeHeartbeatLoop();
+
+  const intervalMs = Number.isFinite(TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS) && TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS >= 30000
+    ? TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS
+    : 300000;
+
+  teamnodeSyncTimer = setInterval(() => {
+    if (!teamnodeSyncContext) return;
+    syncNodeToTeamNode(teamnodeSyncContext).catch(() => null);
+  }, intervalMs);
+}
 
 // 如果订阅器里存在历史节点，先删除旧节点
 function deleteNodes() {
@@ -387,7 +627,12 @@ async function getMetaInfo() {
     });
 
     if (response1.data && response1.data.country_code && response1.data.isp) {
-      return `${response1.data.country_code}-${response1.data.isp}`.replace(/\s+/g, "_");
+      return {
+        countryCode: String(response1.data.country_code || "").trim() || "Unknown",
+        countryName: String(response1.data.country || "").trim() || null,
+        ispName: String(response1.data.isp || "").trim() || "Unknown",
+        display: `${response1.data.country_code}-${response1.data.isp}`.replace(/\s+/g, "_")
+      };
     }
   } catch {
     try {
@@ -397,20 +642,36 @@ async function getMetaInfo() {
       });
 
       if (response2.data && response2.data.status === "success" && response2.data.countryCode && response2.data.org) {
-        return `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, "_");
+        return {
+          countryCode: String(response2.data.countryCode || "").trim() || "Unknown",
+          countryName: String(response2.data.country || "").trim() || null,
+          ispName: String(response2.data.org || "").trim() || "Unknown",
+          display: `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, "_")
+        };
       }
     } catch {
-      return "Unknown";
+      return {
+        countryCode: "Unknown",
+        countryName: null,
+        ispName: "Unknown",
+        display: "Unknown"
+      };
     }
   }
 
-  return "Unknown";
+  return {
+    countryCode: "Unknown",
+    countryName: null,
+    ispName: "Unknown",
+    display: "Unknown"
+  };
 }
 
 // 生成 list 和 sub 订阅内容
 async function generateLinks(argoDomain) {
-  const ISP = await getMetaInfo();
-  const nodeName = NAME ? `${NAME}-${ISP}` : ISP;
+  const metaInfo = await getMetaInfo();
+  const metaDisplay = metaInfo.display || "Unknown";
+  const nodeName = NAME ? `${NAME}-${metaDisplay}` : metaDisplay;
 
   return new Promise((resolve) => {
     setTimeout(() => {
@@ -440,15 +701,28 @@ vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}
 trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
       `;
 
-      console.log(Buffer.from(subTxt).toString("base64"));
-      fs.writeFileSync(subPath, Buffer.from(subTxt).toString("base64"));
+      const contentBase64 = Buffer.from(subTxt).toString("base64");
+      console.log(contentBase64);
+      fs.writeFileSync(subPath, contentBase64);
       console.log(`${FILE_PATH}/sub.txt 保存成功`);
       uploadNodes();
+      syncNodeToTeamNode({
+        argoDomain,
+        nodeName,
+        meta: metaInfo,
+        contentBase64
+      }).finally(() => {
+        startTeamNodeHeartbeatLoop({
+          argoDomain,
+          nodeName,
+          meta: metaInfo,
+          contentBase64
+        });
+      });
 
       app.get(`/${SUB_PATH}`, (req, res) => {
-        const encodedContent = Buffer.from(subTxt).toString("base64");
         res.set("Content-Type", "text/plain; charset=utf-8");
-        res.send(encodedContent);
+        res.send(contentBase64);
       });
 
       resolve(subTxt);
@@ -570,9 +844,32 @@ async function startserver() {
   }
 }
 
-startserver().catch((error) => {
-  console.error("startserver 未捕获异常:", error);
+process.on("SIGINT", () => {
+  stopTeamNodeHeartbeatLoop();
+  process.exit(0);
 });
+
+process.on("SIGTERM", () => {
+  stopTeamNodeHeartbeatLoop();
+  process.exit(0);
+});
+
+if (require.main === module) {
+  startserver().catch((error) => {
+    console.error("startserver 未捕获异常:", error);
+  });
+}
+
+module.exports = {
+  createTeamNodeSyncHeaders,
+  buildTeamNodePayload,
+  syncNodeToTeamNode,
+  syncNodeRegistrationToTeamNode,
+  syncNodeHeartbeatToTeamNode,
+  startTeamNodeHeartbeatLoop,
+  stopTeamNodeHeartbeatLoop,
+  getMetaInfo
+};
 
 // 根路由
 app.get("/", async function(req, res) {
@@ -585,4 +882,6 @@ app.get("/", async function(req, res) {
   }
 });
 
-app.listen(PORT, () => console.log(`HTTP 服务已运行，端口：${PORT}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`HTTP 服务已运行，端口：${PORT}`));
+}

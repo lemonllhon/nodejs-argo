@@ -44,11 +44,41 @@ Telegram交流反馈群组：https://t.me/eooceu
 | NAME | 否 | Vls | 节点名称前缀 |
 | FILE_PATH | 否 | ./tmp | 运行目录 |
 | SUB_PATH | 否 | sub | 订阅路径 |
+| TEAMNODE_SYNC_ENABLED | 否 | 自动推断 | 是否启用 TeamNode 同步；默认只要配置了 `TEAMNODE_SYNC_SECRET` 就会自动启用 |
+| TEAMNODE_SYNC_BASE_URL | 否 | `https://teamnode.lemon.vin` | TeamNode 地址 |
+| TEAMNODE_SYNC_KEY_ID | 否 | `nodejs-argo-prod` | TeamNode 内部同步 Key ID |
+| TEAMNODE_SYNC_SECRET | 否 | - | TeamNode 内部同步签名密钥 |
+| TEAMNODE_SYNC_GROUP_KEY | 否 | argo-auto | TeamNode 节点分组 Key |
+| TEAMNODE_SYNC_PROVIDER | 否 | nodejs-argo | TeamNode 节点供应商标识 |
+| TEAMNODE_SYNC_LABEL_PREFIX | 否 | NAME 或 Argo | TeamNode 节点标签前缀 |
+| TEAMNODE_SYNC_TIMEOUT_MS | 否 | 10000 | TeamNode 同步请求超时 |
+| TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS | 否 | 300000 | TeamNode 心跳间隔（毫秒） |
 
 ## 🌐 订阅地址
 
 - 标准端口：`https://your-domain.com/sub`
 - 非标端口：`http://your-domain.com:port/sub`
+
+## TeamNode 同步
+
+配置 `TEAMNODE_SYNC_BASE_URL`、`TEAMNODE_SYNC_KEY_ID`、`TEAMNODE_SYNC_SECRET` 后，`nodejs-argo` 会在生成订阅后自动：
+
+- 向 TeamNode 注册节点
+- 定时向 TeamNode 发送心跳
+- 保持原有 `UPLOAD_URL` 逻辑兼容
+
+如果你使用默认 TeamNode：
+
+- `TEAMNODE_SYNC_BASE_URL=https://teamnode.lemon.vin`
+- `TEAMNODE_SYNC_KEY_ID=nodejs-argo-prod`
+
+那么部署时通常只需要配置：
+
+```bash
+TEAMNODE_SYNC_SECRET=你的签名密钥
+```
+
+详细说明见：`docs/TeamNode同步接入.md`
 
 ---
 
