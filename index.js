@@ -241,7 +241,7 @@ function isIpRiskAccepted(score) {
   const target = normalizeIpRiskTarget(TEAMNODE_SYNC_IP_RISK_TARGET);
   const numericScore = Number(score);
   if (!Number.isFinite(numericScore)) return false;
-  return target === "high" ? numericScore >= 50 : numericScore < 40;
+  return target === "high" ? numericScore >= 75 : numericScore < 25;
 }
 
 function extractRiskScore(data) {
@@ -289,7 +289,7 @@ async function ensureTeamNodeIpRiskAccepted() {
       return riskInfo;
     }
 
-    const targetLabel = riskInfo.target === "high" ? "高风控IP(>=50)" : "低风控IP(<40)";
+    const targetLabel = riskInfo.target === "high" ? "高风控IP(>=75)" : "低风控IP(<25)";
     console.log(`当前 IP 不符合目标风控：需要 ${targetLabel}`);
 
     if (TEAMNODE_SYNC_IP_RISK_RESTART) {
