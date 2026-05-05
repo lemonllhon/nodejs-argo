@@ -246,21 +246,59 @@ function extractRiskScore(data) {
   return null;
 }
 
+function resolveIpPlatform(data = {}) {
+  const radar = data?.network?.radar || {};
+  const candidates = [
+    radar.aka,
+    radar.name,
+    data?.network?.org
+  ];
+
+  for (const candidate of candidates) {
+    const platform = String(candidate || "").trim();
+    if (platform) return platform;
+  }
+
+  return "Unknown";
+}
+
 async function getIpRiskInfo() {
   const response = await axios.get("https://api.ipbot.com/", {
     headers: { "User-Agent": "Mozilla/5.0" },
     timeout: 5000
   });
 
-  const score = extractRiskScore(response.data || {});
+  const data = response.data || {};
+  const score = extractRiskScore(data);
   const classification = classifyIpRisk(score);
   return {
-    ip: response.data?.ip || null,
-    reasons: response.data?.security?.risk_reasons || [],
-    threatLevel: response.data?.security?.threat_level || null,
-    usageType: response.data?.security?.usage_type || null,
-    isDatacenter: response.data?.security?.is_datacenter ?? null,
-    isProxy: response.data?.security?.is_proxy ?? null,
+    ip: data?.ip || null,
+    riskScore: score,
+    security: {
+      risk_score: data?.security?.risk_score ?? null,
+      risk_reasons: data?.security?.risk_reasons || [],
+      usage_type: data?.security?.usage_type || null,
+      is_datacenter: data?.security?.is_datacenter ?? null,
+      is_proxy: data?.security?.is_proxy ?? null,
+      threat_level: data?.security?.threat_level || null,
+      threat_lists: data?.security?.threat_lists || []
+    },
+    platform: resolveIpPlatform(data),
+    network: {
+      asn: data?.network?.asn || null,
+      org: data?.network?.org || null,
+      radarName: data?.network?.radar?.name || null,
+      radarAka: data?.network?.radar?.aka || null,
+      radarWebsite: data?.network?.radar?.website || null,
+      confidenceLevel: data?.network?.radar?.confidence_level ?? null
+    },
+    location: {
+      country: data?.location?.country || null,
+      countryCode: data?.location?.country_code || null,
+      region: data?.location?.region || null,
+      city: data?.location?.city || null,
+      timezone: data?.location?.timezone || null
+    },
     ...classification
   };
 }
@@ -271,10 +309,46 @@ async function resolveTeamNodeIpRiskInfo() {
   try {
     const riskInfo = await getIpRiskInfo();
     const scoreText = riskInfo.score === null ? "未知" : riskInfo.score;
-    console.log(`${riskInfo.ansiColor}IP 风控检测：${riskInfo.ip || "Unknown"}，风险值 ${scoreText}，${riskInfo.label}\x1b[0m`);
+    const locationText = [
+      riskInfo.location?.countryCode,
+      riskInfo.location?.city
+    ].filter(Boolean).join("-");
+    const reasonsText = Array.isArray(riskInfo.security?.risk_reasons) && riskInfo.security.risk_reasons.length > 0
+      ? riskInfo.security.risk_reasons.join(",")
+      : "无";
+    console.log(`${riskInfo.ansiColor}IP 风控检测：IP=${riskInfo.ip || "Unknown"}，平台=${riskInfo.platform || "Unknown"}，地区=${locationText || "Unknown"}，security.risk_score=${scoreText}，等级=${riskInfo.label}，usage_type=${riskInfo.security?.usage_type || "Unknown"}，is_datacenter=${riskInfo.security?.is_datacenter}，is_proxy=${riskInfo.security?.is_proxy}，risk_reasons=${reasonsText}\x1b[0m`);
     return riskInfo;
   } catch (error) {
     console.error(`IP 风控检测失败，将继续 TeamNode 同步：${error?.message || error}`);
+    return null;
+  }
+}
+
+function sanitizeNodeNamePart(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^\w\u4e00-\u9fa5.-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function buildIpRiskNodeSuffix(ipRisk) {
+  if (!ipRisk) return "";
+
+  const platform = sanitizeNodeNamePart(ipRisk.platform || ipRisk.network?.org || "Unknown");
+  const score = ipRisk.score === null || ipRisk.score === undefined ? "未知" : ipRisk.score;
+  const riskLabel = sanitizeNodeNamePart(ipRisk.label || "未知");
+  return sanitizeNodeNamePart(`${platform}-risk${score}-${riskLabel}`);
+}
+
+async function resolveNodeIpRiskInfo() {
+  try {
+    const riskInfo = await getIpRiskInfo();
+    const scoreText = riskInfo.score === null ? "未知" : riskInfo.score;
+    console.log(`${riskInfo.ansiColor}节点风控展示：${riskInfo.ip || "Unknown"}，${riskInfo.platform || "Unknown"}，security.risk_score=${scoreText}，${riskInfo.label}\x1b[0m`);
+    return riskInfo;
+  } catch (error) {
+    console.error(`节点风控展示检测失败，将使用原节点名称：${error?.message || error}`);
     return null;
   }
 }
@@ -464,7 +538,9 @@ async function syncNodeToTeamNode(context) {
     return null;
   }
 
-  const ipRisk = await resolveTeamNodeIpRiskInfo();
+  const ipRisk = context.ipRisk && !teamnodeSyncRegistered
+    ? context.ipRisk
+    : await resolveTeamNodeIpRiskInfo();
   const syncContext = {
     ...context,
     ipRisk
@@ -914,7 +990,10 @@ async function getMetaInfo() {
 // 生成 list 和 sub 订阅内容
 async function generateLinks(argoDomain) {
   const metaInfo = await getMetaInfo();
-  const nodeName = buildDefaultNodeName(metaInfo);
+  const ipRiskInfo = await resolveNodeIpRiskInfo();
+  const ipRiskSuffix = buildIpRiskNodeSuffix(ipRiskInfo);
+  const baseNodeName = buildDefaultNodeName(metaInfo);
+  const nodeName = ipRiskSuffix ? `${baseNodeName}-${ipRiskSuffix}` : baseNodeName;
 
   return new Promise((resolve) => {
     setTimeout(() => {
@@ -953,12 +1032,14 @@ trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&typ
         argoDomain,
         nodeName,
         meta: metaInfo,
+        ipRisk: ipRiskInfo,
         contentBase64
       }).finally(() => {
         startTeamNodeHeartbeatLoop({
           argoDomain,
           nodeName,
           meta: metaInfo,
+          ipRisk: ipRiskInfo,
           contentBase64
         });
       });
