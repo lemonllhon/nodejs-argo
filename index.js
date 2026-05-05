@@ -6,7 +6,6 @@ const fs = require("fs");
 const path = require("path");
 const { promisify } = require("util");
 const exec = promisify(require("child_process").exec);
-
 const UPLOAD_URL = process.env.UPLOAD_URL || ""; // 节点或订阅自动上传地址，例如：https://merge.xxx.com
 const PROJECT_URL = process.env.PROJECT_URL || ""; // 项目分配的访问地址，例如：https://google.com
 const AUTO_ACCESS = process.env.AUTO_ACCESS || false; // 是否开启自动保活，需要同时配置 PROJECT_URL
