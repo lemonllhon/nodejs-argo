@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const app = express();
 const axios = require("axios");
 const crypto = require("crypto");
@@ -32,6 +32,7 @@ const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
 const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
+const TEAMNODE_SYNC_IP_RISK_TARGET = process.env.TEAMNODE_SYNC_IP_RISK_TARGET || "low";
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -87,6 +88,7 @@ const TEAMNODE_SYNC_ENABLED = parseBoolean(
   process.env.TEAMNODE_SYNC_ENABLED,
   Boolean(TEAMNODE_SYNC_SECRET)
 );
+const TEAMNODE_SYNC_IP_RISK_RESTART = parseBoolean(process.env.TEAMNODE_SYNC_IP_RISK_RESTART, false);
 
 function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
@@ -150,10 +152,156 @@ function createTeamNodeSyncHeaders({ method = "GET", path: requestPath = "/", ra
 function isTeamNodeSyncConfigured() {
   return Boolean(
     TEAMNODE_SYNC_ENABLED
+    && ARGO_DOMAIN
+    && ARGO_AUTH
     && normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL)
     && TEAMNODE_SYNC_KEY_ID
     && TEAMNODE_SYNC_SECRET
   );
+}
+
+function normalizeIpRiskTarget(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["high", "h", "risk", "risky", "高", "高风险"].includes(normalized)) return "high";
+  return "low";
+}
+
+function classifyIpRisk(score) {
+  const numericScore = Number(score);
+  if (!Number.isFinite(numericScore)) {
+    return {
+      score: null,
+      level: "unknown",
+      label: "未知",
+      color: "unknown",
+      ansiColor: "\x1b[37m"
+    };
+  }
+
+  if (numericScore < 15) {
+    return {
+      score: numericScore,
+      level: "very_clean",
+      label: "极度纯净IP",
+      color: "dark_green",
+      ansiColor: "\x1b[32;1m"
+    };
+  }
+
+  if (numericScore < 25) {
+    return {
+      score: numericScore,
+      level: "clean",
+      label: "纯净IP",
+      color: "green",
+      ansiColor: "\x1b[32m"
+    };
+  }
+
+  if (numericScore < 40) {
+    return {
+      score: numericScore,
+      level: "neutral",
+      label: "中性IP",
+      color: "yellow_green",
+      ansiColor: "\x1b[92m"
+    };
+  }
+
+  if (numericScore < 50) {
+    return {
+      score: numericScore,
+      level: "light_risk",
+      label: "轻微风险IP",
+      color: "yellow",
+      ansiColor: "\x1b[33m"
+    };
+  }
+
+  if (numericScore < 70) {
+    return {
+      score: numericScore,
+      level: "elevated_risk",
+      label: "稍高风险IP",
+      color: "orange",
+      ansiColor: "\x1b[38;5;208m"
+    };
+  }
+
+  return {
+    score: numericScore,
+    level: "very_risky",
+    label: "极度风险IP",
+    color: "red",
+    ansiColor: "\x1b[31m"
+  };
+}
+
+function isIpRiskAccepted(score) {
+  const target = normalizeIpRiskTarget(TEAMNODE_SYNC_IP_RISK_TARGET);
+  const numericScore = Number(score);
+  if (!Number.isFinite(numericScore)) return false;
+  return target === "high" ? numericScore >= 50 : numericScore < 40;
+}
+
+function extractRiskScore(data) {
+  const candidates = [
+    data?.security?.risk_score,
+    data?.security?.riskScore,
+    data?.risk_score,
+    data?.riskScore,
+    data?.score
+  ];
+
+  for (const candidate of candidates) {
+    const score = Number(candidate);
+    if (Number.isFinite(score)) return score;
+  }
+
+  return null;
+}
+
+async function getIpRiskInfo() {
+  const response = await axios.get("https://api.ipbot.com/", {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    timeout: 5000
+  });
+
+  const score = extractRiskScore(response.data || {});
+  const classification = classifyIpRisk(score);
+  return {
+    ip: response.data?.ip || null,
+    accepted: isIpRiskAccepted(score),
+    target: normalizeIpRiskTarget(TEAMNODE_SYNC_IP_RISK_TARGET),
+    ...classification
+  };
+}
+
+async function ensureTeamNodeIpRiskAccepted() {
+  if (!isTeamNodeSyncConfigured()) return false;
+
+  try {
+    const riskInfo = await getIpRiskInfo();
+    const scoreText = riskInfo.score === null ? "未知" : riskInfo.score;
+    console.log(`${riskInfo.ansiColor}IP 风控检测：${riskInfo.ip || "Unknown"}，风险值 ${scoreText}，${riskInfo.label}\x1b[0m`);
+
+    if (riskInfo.accepted) {
+      return riskInfo;
+    }
+
+    const targetLabel = riskInfo.target === "high" ? "高风控IP(>=50)" : "低风控IP(<40)";
+    console.log(`当前 IP 不符合目标风控：需要 ${targetLabel}`);
+
+    if (TEAMNODE_SYNC_IP_RISK_RESTART) {
+      console.log("TEAMNODE_SYNC_IP_RISK_RESTART=true，退出进程等待平台重启");
+      setTimeout(() => process.exit(1), 1000);
+    }
+
+    return false;
+  } catch (error) {
+    console.error(`IP 风控检测失败，跳过 TeamNode 同步：${error?.message || error}`);
+    return false;
+  }
 }
 
 function normalizeCountryCode(value) {
@@ -258,7 +406,8 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
       cfport: CFPORT,
       nodeName: context.nodeName || "",
       projectUrl: PROJECT_URL || "",
-      subPath: SUB_PATH || ""
+      subPath: SUB_PATH || "",
+      ipRisk: context.ipRisk || null
     }
   };
 
@@ -340,12 +489,22 @@ async function syncNodeToTeamNode(context) {
     return null;
   }
 
-  teamnodeSyncContext = context;
+  const ipRisk = await ensureTeamNodeIpRiskAccepted();
+  if (!ipRisk) {
+    return null;
+  }
+
+  const syncContext = {
+    ...context,
+    ipRisk
+  };
+
+  teamnodeSyncContext = syncContext;
 
   try {
     return teamnodeSyncRegistered
-      ? await syncNodeHeartbeatToTeamNode(context)
-      : await syncNodeRegistrationToTeamNode(context);
+      ? await syncNodeHeartbeatToTeamNode(syncContext)
+      : await syncNodeRegistrationToTeamNode(syncContext);
   } catch (error) {
     const status = error?.response?.status ? ` (HTTP ${error.response.status})` : "";
     const message = error?.response?.data?.error || error?.message || "unknown_error";
