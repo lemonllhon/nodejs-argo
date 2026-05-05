@@ -32,7 +32,6 @@ const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
 const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
-const TEAMNODE_SYNC_IP_RISK_TARGET = process.env.TEAMNODE_SYNC_IP_RISK_TARGET || "low";
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -88,7 +87,6 @@ const TEAMNODE_SYNC_ENABLED = parseBoolean(
   process.env.TEAMNODE_SYNC_ENABLED,
   Boolean(TEAMNODE_SYNC_SECRET)
 );
-const TEAMNODE_SYNC_IP_RISK_RESTART = parseBoolean(process.env.TEAMNODE_SYNC_IP_RISK_RESTART, false);
 
 function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
@@ -158,12 +156,6 @@ function isTeamNodeSyncConfigured() {
     && TEAMNODE_SYNC_KEY_ID
     && TEAMNODE_SYNC_SECRET
   );
-}
-
-function normalizeIpRiskTarget(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (["high", "h", "risk", "risky", "高", "高风险"].includes(normalized)) return "high";
-  return "low";
 }
 
 function classifyIpRisk(score) {
@@ -237,13 +229,6 @@ function classifyIpRisk(score) {
   };
 }
 
-function isIpRiskAccepted(score) {
-  const target = normalizeIpRiskTarget(TEAMNODE_SYNC_IP_RISK_TARGET);
-  const numericScore = Number(score);
-  if (!Number.isFinite(numericScore)) return false;
-  return target === "high" ? numericScore >= 75 : numericScore < 25;
-}
-
 function extractRiskScore(data) {
   const candidates = [
     data?.security?.risk_score,
@@ -271,36 +256,26 @@ async function getIpRiskInfo() {
   const classification = classifyIpRisk(score);
   return {
     ip: response.data?.ip || null,
-    accepted: isIpRiskAccepted(score),
-    target: normalizeIpRiskTarget(TEAMNODE_SYNC_IP_RISK_TARGET),
+    reasons: response.data?.security?.risk_reasons || [],
+    threatLevel: response.data?.security?.threat_level || null,
+    usageType: response.data?.security?.usage_type || null,
+    isDatacenter: response.data?.security?.is_datacenter ?? null,
+    isProxy: response.data?.security?.is_proxy ?? null,
     ...classification
   };
 }
 
-async function ensureTeamNodeIpRiskAccepted() {
+async function resolveTeamNodeIpRiskInfo() {
   if (!isTeamNodeSyncConfigured()) return false;
 
   try {
     const riskInfo = await getIpRiskInfo();
     const scoreText = riskInfo.score === null ? "未知" : riskInfo.score;
     console.log(`${riskInfo.ansiColor}IP 风控检测：${riskInfo.ip || "Unknown"}，风险值 ${scoreText}，${riskInfo.label}\x1b[0m`);
-
-    if (riskInfo.accepted) {
-      return riskInfo;
-    }
-
-    const targetLabel = riskInfo.target === "high" ? "高风控IP(>=75)" : "低风控IP(<25)";
-    console.log(`当前 IP 不符合目标风控：需要 ${targetLabel}`);
-
-    if (TEAMNODE_SYNC_IP_RISK_RESTART) {
-      console.log("TEAMNODE_SYNC_IP_RISK_RESTART=true，退出进程等待平台重启");
-      setTimeout(() => process.exit(1), 1000);
-    }
-
-    return false;
+    return riskInfo;
   } catch (error) {
-    console.error(`IP 风控检测失败，跳过 TeamNode 同步：${error?.message || error}`);
-    return false;
+    console.error(`IP 风控检测失败，将继续 TeamNode 同步：${error?.message || error}`);
+    return null;
   }
 }
 
@@ -489,11 +464,7 @@ async function syncNodeToTeamNode(context) {
     return null;
   }
 
-  const ipRisk = await ensureTeamNodeIpRiskAccepted();
-  if (!ipRisk) {
-    return null;
-  }
-
+  const ipRisk = await resolveTeamNodeIpRiskInfo();
   const syncContext = {
     ...context,
     ipRisk
