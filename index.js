@@ -158,77 +158,6 @@ function isTeamNodeSyncConfigured() {
   );
 }
 
-function classifyIpRisk(score) {
-  const numericScore = Number(score);
-  if (!Number.isFinite(numericScore)) {
-    return {
-      score: null,
-      level: "unknown",
-      label: "未知",
-      color: "unknown",
-      ansiColor: "\x1b[37m"
-    };
-  }
-
-  if (numericScore < 15) {
-    return {
-      score: numericScore,
-      level: "very_clean",
-      label: "极度纯净IP",
-      color: "dark_green",
-      ansiColor: "\x1b[32;1m"
-    };
-  }
-
-  if (numericScore < 25) {
-    return {
-      score: numericScore,
-      level: "clean",
-      label: "纯净IP",
-      color: "green",
-      ansiColor: "\x1b[32m"
-    };
-  }
-
-  if (numericScore < 40) {
-    return {
-      score: numericScore,
-      level: "neutral",
-      label: "中性IP",
-      color: "yellow_green",
-      ansiColor: "\x1b[92m"
-    };
-  }
-
-  if (numericScore < 50) {
-    return {
-      score: numericScore,
-      level: "light_risk",
-      label: "轻微风险IP",
-      color: "yellow",
-      ansiColor: "\x1b[33m"
-    };
-  }
-
-  if (numericScore < 70) {
-    return {
-      score: numericScore,
-      level: "elevated_risk",
-      label: "稍高风险IP",
-      color: "orange",
-      ansiColor: "\x1b[38;5;208m"
-    };
-  }
-
-  return {
-    score: numericScore,
-    level: "very_risky",
-    label: "极度风险IP",
-    color: "red",
-    ansiColor: "\x1b[31m"
-  };
-}
-
 function extractRiskScore(data) {
   const candidates = [
     data?.security?.risk_score,
@@ -270,9 +199,9 @@ async function getIpRiskInfo() {
 
   const data = response.data || {};
   const score = extractRiskScore(data);
-  const classification = classifyIpRisk(score);
   return {
     ip: data?.ip || null,
+    score,
     riskScore: score,
     security: {
       risk_score: data?.security?.risk_score ?? null,
@@ -298,8 +227,7 @@ async function getIpRiskInfo() {
       region: data?.location?.region || null,
       city: data?.location?.city || null,
       timezone: data?.location?.timezone || null
-    },
-    ...classification
+    }
   };
 }
 
@@ -316,7 +244,7 @@ async function resolveTeamNodeIpRiskInfo() {
     const reasonsText = Array.isArray(riskInfo.security?.risk_reasons) && riskInfo.security.risk_reasons.length > 0
       ? riskInfo.security.risk_reasons.join(",")
       : "无";
-    console.log(`${riskInfo.ansiColor}IP 风控检测：IP=${riskInfo.ip || "Unknown"}，平台=${riskInfo.platform || "Unknown"}，地区=${locationText || "Unknown"}，security.risk_score=${scoreText}，等级=${riskInfo.label}，usage_type=${riskInfo.security?.usage_type || "Unknown"}，is_datacenter=${riskInfo.security?.is_datacenter}，is_proxy=${riskInfo.security?.is_proxy}，risk_reasons=${reasonsText}\x1b[0m`);
+    console.log(`IP 风控检测：IP=${riskInfo.ip || "Unknown"}，平台=${riskInfo.platform || "Unknown"}，地区=${locationText || "Unknown"}，security.risk_score=${scoreText}，usage_type=${riskInfo.security?.usage_type || "Unknown"}，is_datacenter=${riskInfo.security?.is_datacenter}，is_proxy=${riskInfo.security?.is_proxy}，risk_reasons=${reasonsText}`);
     return riskInfo;
   } catch (error) {
     console.error(`IP 风控检测失败，将继续 TeamNode 同步：${error?.message || error}`);
@@ -337,15 +265,14 @@ function buildIpRiskNodeSuffix(ipRisk) {
 
   const platform = sanitizeNodeNamePart(ipRisk.platform || ipRisk.network?.org || "Unknown");
   const score = ipRisk.score === null || ipRisk.score === undefined ? "未知" : ipRisk.score;
-  const riskLabel = sanitizeNodeNamePart(ipRisk.label || "未知");
-  return sanitizeNodeNamePart(`${platform}-risk${score}-${riskLabel}`);
+  return sanitizeNodeNamePart(`${platform}-risk${score}`);
 }
 
 async function resolveNodeIpRiskInfo() {
   try {
     const riskInfo = await getIpRiskInfo();
     const scoreText = riskInfo.score === null ? "未知" : riskInfo.score;
-    console.log(`${riskInfo.ansiColor}节点风控展示：${riskInfo.ip || "Unknown"}，${riskInfo.platform || "Unknown"}，security.risk_score=${scoreText}，${riskInfo.label}\x1b[0m`);
+    console.log(`节点风控展示：${riskInfo.ip || "Unknown"}，${riskInfo.platform || "Unknown"}，security.risk_score=${scoreText}`);
     return riskInfo;
   } catch (error) {
     console.error(`节点风控展示检测失败，将使用原节点名称：${error?.message || error}`);
