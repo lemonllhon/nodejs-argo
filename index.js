@@ -601,7 +601,9 @@ async function generateConfig() {
           clients: [{ id: UUID, flow: "xtls-rprx-vision" }],
           decryption: "none",
           fallbacks: [
-            { dest: 3001 },
+            // 未匹配代理 WebSocket 路径的普通 HTTP 请求（例如根路径 /）
+            // 回落到 Express Web 服务，避免固定隧道指向 ARGO_PORT 时返回 502。
+            { dest: Number(PORT) },
             { path: "/vless-argo", dest: 3002 },
             { path: "/vmess-argo", dest: 3003 },
             { path: "/trojan-argo", dest: 3004 }
