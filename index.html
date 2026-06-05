@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quantum Geometric Matrix</title>
+    <style>
+        /* 强制开启 GPU 硬件加速 */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            transform-style: preserve-3d;
+            backface-visibility: hidden;
+            will-change: transform;
+        }
+
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #080710;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            perspective: 1200px;
+        }
+
+        /* 赛博迷幻波浪背景（无滤镜，纯渐变，性能极高） */
+        .bg-matrix {
+            position: absolute;
+            width: 200%;
+            height: 200%;
+            background: 
+                radial-gradient(transparent 50%, #080710 85%),
+                repeating-linear-gradient(45deg, rgba(236, 72, 153, 0.08) 0px, rgba(236, 72, 153, 0.08) 2px, transparent 2px, transparent 40px),
+                repeating-linear-gradient(-45deg, rgba(59, 130, 246, 0.08) 0px, rgba(59, 130, 246, 0.08) 2px, transparent 2px, transparent 40px);
+            animation: bgMove 40s linear infinite;
+            z-index: 1;
+        }
+
+        @keyframes bgMove {
+            0% { transform: translate(-25%, -25%) rotate(0deg); }
+            100% { transform: translate(-25%, -25%) rotate(360deg); }
+        }
+
+        /* 核心 3D 悬浮空间 */
+        .stage {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 2;
+        }
+
+        /* 流行特效一：高频霓虹光环（利用无损盒阴影替代模糊滤镜） */
+        .neon-ring {
+            position: absolute;
+            width: 45vh;
+            height: 45vh;
+            border-radius: 41% 59% 45% 55% / 57% 41% 59% 43%;
+            border: 4px solid transparent;
+            background: linear-gradient(#080710, #080710) padding-box,
+                        linear-gradient(135deg, #00f2fe, #4facfe, #000, #ff007f, #7f00ff) border-box;
+            box-shadow: 0 0 40px rgba(0, 242, 254, 0.2), inset 0 0 40px rgba(127, 0, 255, 0.2);
+            animation: morph 8s ease-in-out infinite alternate, spin 20s linear infinite;
+        }
+
+        .ring-reverse {
+            width: 48vh;
+            height: 48vh;
+            border-radius: 53% 47% 52% 48% / 46% 54% 46% 54%;
+            background: linear-gradient(#080710, #080710) padding-box,
+                        linear-gradient(-135deg, #ff007f, #7f00ff, #00f2fe) border-box;
+            animation: morph 6s ease-in-out infinite alternate-reverse, spin 15s linear infinite reverse;
+            opacity: 0.7;
+        }
+
+        @keyframes morph {
+            0% { border-radius: 41% 59% 45% 55% / 57% 41% 59% 43%; }
+            50% { border-radius: 65% 35% 62% 38% / 45% 55% 45% 55%; }
+            100% { border-radius: 45% 55% 41% 59% / 59% 45% 55% 41%; }
+        }
+
+        @keyframes spin {
+            100% { transform: rotate(360deg); }
+        }
+
+        /* 流行特效二：浮动无损 3D 几何矩阵 */
+        .geometric-mesh {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .cube {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            background: transparent;
+            border: 2px solid #00f2fe;
+            box-shadow: 0 0 15px rgba(0, 242, 254, 0.6);
+        }
+
+        .triangle {
+            position: absolute;
+            width: 0; height: 0;
+            border-left: 12px solid transparent;
+            border-right: 12px solid transparent;
+            border-bottom: 22px solid #ff007f;
+            filter: drop-shadow(0 0 10px rgba(255, 0, 127, 0.8));
+        }
+
+        /* 流行特效三：视差微粒群（利用原生 CSS 3D 位移，丝滑不卡顿） */
+        .particle {
+            position: absolute;
+            width: 4px;
+            height: 4px;
+            background: #fff;
+            border-radius: 50%;
+            box-shadow: 0 0 8px #fff, 0 0 15px #7f00ff;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="bg-matrix"></div>
+
+    <div class="stage">
+        <div class="neon-ring"></div>
+        <div class="neon-ring ring-reverse"></div>
+
+        <div class="geometric-mesh" id="mesh"></div>
+    </div>
+
+    <script>
+        const mesh = document.getElementById('mesh');
+        const stage = document.querySelector('.stage');
+        
+        // 用纯原生数据生成轻量级几何粒子，避免复杂的 DOM 结构导致的卡顿
+        const particleCount = 40;
+        
+        for (let i = 0; i < particleCount; i++) {
+            const isCube = Math.random() > 0.5;
+            const el = document.createElement('div');
+            
+            if (i < 10) {
+                el.className = isCube ? 'cube' : 'triangle';
+            } else {
+                el.className = 'particle';
+            }
+
+            // 随机全屏分布与 3D 深度分层 (Z轴值)
+            const x = Math.random() * 100;
+            const y = Math.random() * 100;
+            const z = Math.floor(Math.random() * 400) - 200; // -200px 到 200px 的深度
+            const speed = 10 + Math.random() * 20;
+
+            el.style.left = `${x}%`;
+            el.style.top = `${y}%`;
+            
+            // 独立的、开启了硬件加速的漂移动画
+            el.style.transform = `translateZ(${z}px)`;
+            el.animate([
+                { transform: `translateZ(${z}px) translateY(0px) rotate(0deg)` },
+                { transform: `translateZ(${z}px) translateY(-60px) rotate(${Math.random() * 360}deg)` }
+            ], {
+                duration: speed * 1000,
+                iterations: Infinity,
+                direction: 'alternate',
+                easing: 'ease-in-out'
+            });
+
+            mesh.appendChild(el);
+        }
+
+        // 丝滑的 3D 视差交互：通过矩阵变换直接调动 GPU，完全不占用 CPU 渲染主线程
+        window.addEventListener('mousemove', (e) => {
+            const rotateX = (window.innerHeight / 2 - e.pageY) / 30;
+            const rotateY = (e.pageX - window.innerWidth / 2) / 30;
+            
+            // 顺畅的 3D 倾斜
+            stage.style.transform = `rotateX(${rotateX}deg) rotateY(${rotateY}deg)`;
+        });
+    </script>
+</body>
+</html>
