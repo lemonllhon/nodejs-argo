@@ -972,11 +972,6 @@ trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&typ
         });
       });
 
-      app.get(`/${SUB_PATH}`, (req, res) => {
-        res.set("Content-Type", "text/plain; charset=utf-8");
-        res.send(contentBase64);
-      });
-
       resolve(subTxt);
     }, 2000);
   });
@@ -1146,7 +1141,7 @@ app.get("/", async function(req, res) {
     const data = await fs.promises.readFile(filePath, "utf8");
     res.send(data);
   } catch {
-    res.send("Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) to get your nodes!");
+    res.send("Hello world!");
   }
 });
 
