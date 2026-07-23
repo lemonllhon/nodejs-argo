@@ -676,14 +676,14 @@ function authorizeFiles(filePaths) {
 // 根据认证方式生成 cloudflared 启动参数
 function buildCloudflaredArgs() {
   if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-    return `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 run --token ${ARGO_AUTH}`;
   }
 
   if (ARGO_AUTH.match(/TunnelSecret/)) {
-    return `tunnel --edge-ip-version auto --config "${tunnelYamlPath}" run`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" run`;
   }
 
-  return `tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;
+  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;
 }
 
 // 启动镜像内置的哪吒、Xray、cloudflared

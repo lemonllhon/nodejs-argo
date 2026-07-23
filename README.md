@@ -26,7 +26,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 ### Docker 镜像中的 cloudflared 自动更新
 
-GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。因此重新部署前执行 `docker pull` 即可获取更新后的内置 cloudflared；Dockerfile 中的版本仅作为本地构建时的兜底值。
+GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。容器运行期间，cloudflared 也会每 24 小时自动检查并更新自身；重新创建容器后则使用镜像内置的最新版本。Dockerfile 中的版本仅作为本地构建时的兜底值。cloudflared 自更新会重启 Tunnel，单连接可能产生短暂重连。
 
 ## 📋 环境变量
 
