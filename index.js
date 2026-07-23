@@ -17,6 +17,11 @@ const PLATFORM_PROXY_MODE = parseBoolean(
   process.env.PLATFORM_PROXY_MODE ?? process.env.PLATFORM_MODE,
   false
 );
+const PLATFORM_PUBLIC_DOMAIN = process.env.PLATFORM_PUBLIC_DOMAIN
+  || process.env.RAILWAY_PUBLIC_DOMAIN
+  || process.env.BOXD_PUBLIC_DOMAIN
+  || process.env.PUBLIC_DOMAIN
+  || "";
 const PORT = process.env.SERVER_PORT || (PLATFORM_PROXY_MODE ? 3000 : process.env.PORT || 3000); // 容器内部网页端口
 const XRAY_LOG_LEVEL = process.env.XRAY_LOG_LEVEL || "warning";
 const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
@@ -25,7 +30,7 @@ const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用�
 const NEZHA_SERVER = process.env.NEZHA_SERVER || ""; // 哪吒 v1 格式：nz.abc.com:8008；v0 格式：nz.abc.com
 const NEZHA_PORT = process.env.NEZHA_PORT || ""; // 使用哪吒 v1 时留空，使用 v0 时填写
 const NEZHA_KEY = process.env.NEZHA_KEY || ""; // 哪吒 v1 的 NZ_CLIENT_SECRET 或 v0 的 agent 密钥
-const ARGO_DOMAIN = process.env.ARGO_DOMAIN || ""; // 固定隧道域名，留空则启用临时隧道
+const ARGO_DOMAIN = process.env.ARGO_DOMAIN || (PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_DOMAIN : ""); // 平台模式可由平台域名环境变量自动提供
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
 const DIRECT_MODE = parseBoolean(process.env.DIRECT_MODE, false);
@@ -736,7 +741,7 @@ function validatePlatformProxyMode() {
   }
 
   if (!isValidDomain(ARGO_DOMAIN)) {
-    throw new Error("PLATFORM_PROXY_MODE=true 时 ARGO_DOMAIN 必须是有效的域名，例如 node.example.com");
+    throw new Error("PLATFORM_PROXY_MODE=true 时未找到平台公网域名；请配置 ARGO_DOMAIN 或 PLATFORM_PUBLIC_DOMAIN");
   }
 
   if (!isValidPort(Number.parseInt(ARGO_PORT, 10))) {

@@ -92,7 +92,6 @@ docker run -d --name lemon-node --restart unless-stopped \
 {
   "PLATFORM_PROXY_MODE": "true",
   "CF_DNS_ENABLED": "false",
-  "ARGO_DOMAIN": "lemonboxd.boxd.sh",
   "ARGO_PORT": "8001",
   "SERVER_PORT": "3000",
   "PLATFORM_PUBLIC_PORT": "443",
@@ -102,7 +101,7 @@ docker run -d --name lemon-node --restart unless-stopped \
 }
 ```
 
-上例中的 `lemonboxd.boxd.sh` 是 boxd 当前验证通过的平台域名；部署到 Railway 时替换为 Railway 提供的服务域名或已绑定的自定义域名。
+在 Railway 中可以不填写 `ARGO_DOMAIN`：程序会自动使用 Railway 提供的 `RAILWAY_PUBLIC_DOMAIN`。其他平台如果提供 `PLATFORM_PUBLIC_DOMAIN`、`BOXD_PUBLIC_DOMAIN` 或 `PUBLIC_DOMAIN`，程序也会自动使用；如果平台没有提供公网域名环境变量，则仍需填写 `ARGO_DOMAIN`。boxd 当前验证域名为 `lemonboxd.boxd.sh`。
 
 在 Railway、boxd 等平台中，将平台 HTTPS Proxy 的 Target Port 指向 `ARGO_PORT`（例如 8001）。平台负责外部 HTTPS 443 和证书，容器不申请证书，也不启动 Cloudflare Tunnel。`CF_DNS_RECORD_NAME`、`CF_API_TOKEN`、`CFIP`、`CFPORT`、`ARGO_AUTH` 在 `CF_DNS_ENABLED=false` 的平台代理模式下无需配置。
 
@@ -140,6 +139,7 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | DIRECT_KEY_FILE | 直连模式二选一 | - | 已有 TLS 私钥路径，需与 `DIRECT_CERT_FILE` 同时配置 |
 | DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | admin@lemon.vin | Let's Encrypt 邮箱；可覆盖默认值，与上面证书路径二选一 |
 | PLATFORM_PROXY_MODE | 否 | false | 是否启用平台边缘代理模式；启用后复用 `ARGO_PORT`，不启动 cloudflared、Nginx 或 Certbot |
+| PLATFORM_PUBLIC_DOMAIN | 平台代理模式可选 | 自动读取平台变量 | 平台公网域名覆盖值；也会自动读取 `RAILWAY_PUBLIC_DOMAIN`、`BOXD_PUBLIC_DOMAIN` 或 `PUBLIC_DOMAIN` |
 | PLATFORM_PUBLIC_PORT | 平台代理模式可选 | 443 | 平台外部 HTTPS 端口，仅用于生成节点链接，容器入口仍使用 `ARGO_PORT` |
 | CF_DNS_ENABLED | 否 | false | 是否启用直连模式 Cloudflare DNS 自动解析；默认不调用 Cloudflare DNS API |
 | CF_API_TOKEN | 否 | - | 启用 `CF_DNS_ENABLED=true` 后使用的 Cloudflare DNS API Token，需 Zone Read + DNS Write |
