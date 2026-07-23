@@ -66,6 +66,42 @@ docker run -d --name lemon-node --restart unless-stopped \
 
 直连模式生成的 VLESS、VMess、Trojan 节点地址统一为 `ARGO_DOMAIN:DIRECT_PORT`，其中 `DIRECT_PORT` 默认是 443，`DIRECT_HTTP_PORT` 默认是 80。原有 Cloudflare Tunnel 模式保持不变。
 
+#### 公网 80/443 可访问时自动申请证书
+
+如果 Docker 主机拥有真正可入站的公网 IP，并且防火墙、云安全组和端口映射均已放行 TCP 80、443，可以使用直连模式自动申请和续期 Let's Encrypt 证书：
+
+```bash
+docker run -d --name lemon-node --restart unless-stopped \
+  -p 80:80 -p 443:443 \
+  -v /srv/lemon-node/letsencrypt:/etc/letsencrypt \
+  -e DIRECT_MODE=true \
+  -e ARGO_DOMAIN=node.example.com \
+  -e DIRECT_LETSENCRYPT_EMAIL=admin@example.com \
+  -e CF_DNS_ENABLED=false \
+  -e UUID=你的UUID \
+  ghcr.io/lemonllhon/nodejs:latest
+```
+
+使用前请确认：
+
+* `ARGO_DOMAIN` 的 A/AAAA 记录已解析到该 Docker 主机的公网 IP；
+* 外部访问 `http://ARGO_DOMAIN/.well-known/acme-challenge/` 可以到达容器的 80 端口；
+* 443 端口未被其他服务占用；
+* `DIRECT_LETSENCRYPT_EMAIL` 只是 Let's Encrypt 证书通知和续期邮箱，不是 Cloudflare 或 cloudflared 邮箱；
+* 直连模式不需要 `ARGO_AUTH`、`ARGO_PORT`、`CFIP` 或 `CF_API_TOKEN`。
+
+证书申请成功后，容器使用 Nginx 在 443 接收 HTTPS/WebSocket，并将三个协议路径转发给 Xray。证书会保存到 `/etc/letsencrypt`，建议保留挂载卷以便容器重建后继续使用；容器每 12 小时检查一次证书续期。
+
+如果希望程序自动维护 Cloudflare DNS，将 DNS 记录切换为 DNS-only，可以改为：
+
+```bash
+-e CF_DNS_ENABLED=true \
+-e CF_DNS_RECORD_NAME=node.example.com \
+-e CF_API_TOKEN=你的Cloudflare_DNS_API_Token
+```
+
+此时 `CF_DNS_RECORD_NAME` 必须与 `ARGO_DOMAIN` 完全一致，API Token 只需要目标 Zone 的 `Zone Read` 和 `DNS Write` 权限。若主机处于 NAT、平台随机端口转发或无法从公网访问 80/443，请使用上面的平台代理模式，不要使用直连证书模式。
+
 ### 平台边缘代理模式（Railway 等平台）
 
 如果部署平台可以提供 HTTPS 域名，并将域名的 443 请求转发到容器的非标准端口，可以设置 `PLATFORM_PROXY_MODE=true`。此模式复用 `ARGO_PORT` 作为容器唯一入口：Xray 在该端口接收普通 HTTP/WebSocket 请求，平台边缘负责公网 HTTPS、证书和转发，容器不会启动 Cloudflare Tunnel、Nginx 或 Certbot。
