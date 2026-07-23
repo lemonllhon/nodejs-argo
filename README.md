@@ -86,6 +86,26 @@ docker run -d --name lemon-node --restart unless-stopped \
   ghcr.io/lemonllhon/nodejs:latest
 ```
 
+平台代理模式环境变量（Cloudflare DNS 默认关闭）：
+
+```json
+{
+  "PLATFORM_PROXY_MODE": "true",
+  "CF_DNS_ENABLED": "false",
+  "ARGO_DOMAIN": "lemonboxd.boxd.sh",
+  "ARGO_PORT": "8001",
+  "SERVER_PORT": "3000",
+  "PLATFORM_PUBLIC_PORT": "443",
+  "NAME": "<NAME>",
+  "UUID": "<UUID>",
+  "TEAMNODE_SYNC_SECRET": "<TEAMNODE_SYNC_SECRET>"
+}
+```
+
+上例中的 `lemonboxd.boxd.sh` 是 boxd 当前验证通过的平台域名；部署到 Railway 时替换为 Railway 提供的服务域名或已绑定的自定义域名。
+
+在 Railway、boxd 等平台中，将平台 HTTPS Proxy 的 Target Port 指向 `ARGO_PORT`（例如 8001）。平台负责外部 HTTPS 443 和证书，容器不申请证书，也不启动 Cloudflare Tunnel。`CF_DNS_RECORD_NAME`、`CF_API_TOKEN`、`CFIP`、`CFPORT`、`ARGO_AUTH` 在 `CF_DNS_ENABLED=false` 的平台代理模式下无需配置。
+
 如果使用自定义域名，需要先在平台完成域名绑定，再将该域名填写为 `ARGO_DOMAIN`。如果域名仍由 Cloudflare 托管，建议使用 DNS-only，避免再次经过 Cloudflare 的 WebSocket 边缘处理。
 
 ### Docker 镜像中的 cloudflared 自动更新
