@@ -57,7 +57,7 @@ COPY --from=downloader /out/nezha-agent-legacy /usr/local/bin/nezha-agent-legacy
 
 COPY . .
 
-EXPOSE 80/tcp 443/tcp 3000/tcp
+EXPOSE 80/tcp 443/tcp 3000/tcp 8001/tcp
 
 RUN apk add --no-cache bash ca-certificates certbot coreutils curl gcompat iproute2 nginx openssl && \
     chmod +x index.js /usr/local/bin/cloudflared /usr/local/bin/xray /usr/local/bin/nezha-agent /usr/local/bin/nezha-agent-legacy && \

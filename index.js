@@ -12,7 +12,12 @@ const PROJECT_URL = process.env.PROJECT_URL || ""; // 项目分配的访问地�
 const AUTO_ACCESS = process.env.AUTO_ACCESS || false; // 是否开启自动保活，需要同时配置 PROJECT_URL
 const FILE_PATH = process.env.FILE_PATH || ".tmp"; // 运行目录，也是订阅文件保存目录
 const SUB_PATH = process.env.SUB_PATH || "sub"; // 订阅路径
-const PORT = process.env.SERVER_PORT || process.env.PORT || 3000; // HTTP 服务监听端口
+// 平台代理模式由 Railway 等平台在边缘终止 TLS，再将普通 HTTP/WebSocket 转发到 ARGO_PORT。
+const PLATFORM_PROXY_MODE = parseBoolean(
+  process.env.PLATFORM_PROXY_MODE ?? process.env.PLATFORM_MODE,
+  false
+);
+const PORT = process.env.SERVER_PORT || (PLATFORM_PROXY_MODE ? 3000 : process.env.PORT || 3000); // 容器内部网页端口
 const XRAY_LOG_LEVEL = process.env.XRAY_LOG_LEVEL || "warning";
 const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
 const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
@@ -24,6 +29,7 @@ const ARGO_DOMAIN = process.env.ARGO_DOMAIN || ""; // 固定隧道域名，留�
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
 const DIRECT_MODE = parseBoolean(process.env.DIRECT_MODE, false);
+const PLATFORM_PUBLIC_PORT = Number.parseInt(process.env.PLATFORM_PUBLIC_PORT || "443", 10);
 const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
 const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 10);
 const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
@@ -37,8 +43,8 @@ const CF_DNS_PUBLIC_IP = process.env.CF_DNS_PUBLIC_IP || "";
 const CF_DNS_TTL = Number.parseInt(process.env.CF_DNS_TTL || "120", 10);
 const CF_DNS_SYNC_INTERVAL_MS = Number.parseInt(process.env.CF_DNS_SYNC_INTERVAL_MS || "300000", 10);
 const CF_DNS_REPLACE_CNAME = parseBoolean(process.env.CF_DNS_REPLACE_CNAME, true);
-const CFIP = process.env.CFIP || (DIRECT_MODE ? ARGO_DOMAIN : "www.cloudflare.com"); // 节点优选域名或优选 IP
-const CFPORT = process.env.CFPORT || (DIRECT_MODE ? DIRECT_PORT : 443); // 节点优选域名或优选 IP 对应端口
+const CFIP = process.env.CFIP || ((DIRECT_MODE || PLATFORM_PROXY_MODE) ? ARGO_DOMAIN : "www.cloudflare.com"); // 节点优选域名或优选 IP
+const CFPORT = process.env.CFPORT || (DIRECT_MODE ? DIRECT_PORT : PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_PORT : 443); // 节点端口
 const NAME = process.env.NAME || ""; // 节点名称前缀
 const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
 const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
@@ -717,13 +723,38 @@ function isValidPort(value) {
   return Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
+function isValidDomain(value) {
+  return /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/.test(
+    String(value || "").trim()
+  );
+}
+
+function validatePlatformProxyMode() {
+  if (!PLATFORM_PROXY_MODE) return;
+
+  if (DIRECT_MODE) {
+    throw new Error("PLATFORM_PROXY_MODE=true 与 DIRECT_MODE=true 不能同时启用");
+  }
+
+  if (!isValidDomain(ARGO_DOMAIN)) {
+    throw new Error("PLATFORM_PROXY_MODE=true 时 ARGO_DOMAIN 必须是有效的域名，例如 node.example.com");
+  }
+
+  if (!isValidPort(Number.parseInt(ARGO_PORT, 10))) {
+    throw new Error("PLATFORM_PROXY_MODE=true 时 ARGO_PORT 必须是 1-65535 之间的端口");
+  }
+
+  if (!isValidPort(PLATFORM_PUBLIC_PORT)) {
+    throw new Error("PLATFORM_PUBLIC_PORT 必须是 1-65535 之间的端口");
+  }
+}
+
 function validateDirectMode() {
   if (!DIRECT_MODE) return;
 
   const domain = String(ARGO_DOMAIN || "").trim();
-  const hostnamePattern = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 
-  if (!hostnamePattern.test(domain)) {
+  if (!isValidDomain(domain)) {
     throw new Error("DIRECT_MODE=true 时 ARGO_DOMAIN 必须是有效的域名，例如 justrunmy.lemon.vin");
   }
 
@@ -1115,10 +1146,10 @@ function buildCloudflaredArgs() {
 async function startProcesses() {
   try {
     ensureBinaryExists(webPath, "xray");
-    if (!DIRECT_MODE) {
+    if (!DIRECT_MODE && !PLATFORM_PROXY_MODE) {
       ensureBinaryExists(botPath, "cloudflared");
     }
-    authorizeFiles(DIRECT_MODE ? [webPath] : [webPath, botPath]);
+    authorizeFiles(DIRECT_MODE || PLATFORM_PROXY_MODE ? [webPath] : [webPath, botPath]);
   } catch (error) {
     console.error(`二进制检查失败：${error.message}`);
     throw error;
@@ -1199,6 +1230,9 @@ uuid: ${UUID}`;
       console.error(`直连网关启动失败：${error.message}`);
       throw error;
     }
+  } else if (PLATFORM_PROXY_MODE) {
+    console.log(`平台代理模式已启动：容器入口 ${ARGO_PORT}，公网 HTTPS 端口 ${PLATFORM_PUBLIC_PORT}`);
+    console.log("平台应将 HTTPS/HTTP WebSocket 请求转发到容器的 ARGO_PORT；容器不申请、不校验证书");
   } else {
     try {
       const args = buildCloudflaredArgs();
@@ -1215,7 +1249,11 @@ uuid: ${UUID}`;
 
 // 生成固定隧道配置文件
 function argoType() {
-  if (DIRECT_MODE) {
+  if (DIRECT_MODE || PLATFORM_PROXY_MODE) {
+    if (PLATFORM_PROXY_MODE) {
+      console.log("PLATFORM_PROXY_MODE 已启用，不启动 Cloudflare Tunnel");
+      return;
+    }
     console.log("DIRECT_MODE 已启用，不启动 Cloudflare Tunnel");
     return;
   }
@@ -1249,9 +1287,9 @@ function argoType() {
 async function extractDomains() {
   let argoDomain;
 
-  if (DIRECT_MODE) {
+  if (DIRECT_MODE || PLATFORM_PROXY_MODE) {
     argoDomain = ARGO_DOMAIN;
-    console.log("直连域名:", argoDomain);
+    console.log(PLATFORM_PROXY_MODE ? "平台代理域名:" : "直连域名:", argoDomain);
     await generateLinks(argoDomain);
     return;
   }
@@ -1371,8 +1409,8 @@ async function generateLinks(argoDomain) {
   const ipRiskSuffix = buildIpRiskNodeSuffix(ipRiskInfo);
   const baseNodeName = buildDefaultNodeName(metaInfo);
   const nodeName = ipRiskSuffix ? `${baseNodeName}-${ipRiskSuffix}` : baseNodeName;
-  const nodeAddress = DIRECT_MODE ? ARGO_DOMAIN : CFIP;
-  const nodePort = DIRECT_MODE ? DIRECT_PORT : CFPORT;
+  const nodeAddress = DIRECT_MODE || PLATFORM_PROXY_MODE ? ARGO_DOMAIN : CFIP;
+  const nodePort = DIRECT_MODE ? DIRECT_PORT : PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_PORT : CFPORT;
 
   return new Promise((resolve) => {
     setTimeout(() => {
@@ -1531,6 +1569,7 @@ async function AddVisitTask() {
 async function startserver() {
   try {
     validateDirectMode();
+    validatePlatformProxyMode();
     await syncCloudflareDnsRecord();
     startCloudflareDnsSyncLoop();
     deleteNodes();

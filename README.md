@@ -64,6 +64,28 @@ docker run -d --name lemon-node --restart unless-stopped \
 
 直连模式生成的 VLESS、VMess、Trojan 节点地址统一为 `ARGO_DOMAIN:DIRECT_PORT`，其中 `DIRECT_PORT` 默认是 443，`DIRECT_HTTP_PORT` 默认是 80。原有 Cloudflare Tunnel 模式保持不变。
 
+### 平台边缘代理模式（Railway 等平台）
+
+如果部署平台可以提供 HTTPS 域名，并将域名的 443 请求转发到容器的非标准端口，可以设置 `PLATFORM_PROXY_MODE=true`。此模式复用 `ARGO_PORT` 作为容器唯一入口：Xray 在该端口接收普通 HTTP/WebSocket 请求，平台边缘负责公网 HTTPS、证书和转发，容器不会启动 Cloudflare Tunnel、Nginx 或 Certbot。
+
+此模式下，`ARGO_DOMAIN` 应填写平台分配的域名或已经绑定到平台的自定义域名，平台的 Target Port 选择与 `ARGO_PORT` 相同的端口（例如 8001）。生成的节点仍然使用公网 `ARGO_DOMAIN:PLATFORM_PUBLIC_PORT`、TLS 和 WebSocket；TLS 只在平台边缘终止，容器内部不需要证书。`CF_API_TOKEN`、`CFIP`、`CFPORT`、`DIRECT_MODE` 和 `ARGO_AUTH` 在此模式下不需要配置。
+
+示例（容器使用 8001，平台外部使用 HTTPS 443）：
+
+```bash
+docker run -d --name lemon-node --restart unless-stopped \
+  -p 8001:8001 \
+  -e PLATFORM_PROXY_MODE=true \
+  -e ARGO_PORT=8001 \
+  -e SERVER_PORT=3000 \
+  -e PLATFORM_PUBLIC_PORT=443 \
+  -e ARGO_DOMAIN=your-service.up.railway.app \
+  -e UUID=你的UUID \
+  ghcr.io/lemonllhon/nodejs:latest
+```
+
+如果使用自定义域名，需要先在平台完成域名绑定，再将该域名填写为 `ARGO_DOMAIN`。如果域名仍由 Cloudflare 托管，建议使用 DNS-only，避免再次经过 Cloudflare 的 WebSocket 边缘处理。
+
 ### Docker 镜像中的 cloudflared 自动更新
 
 GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。容器运行期间，cloudflared 也会每 24 小时自动检查并更新自身；重新创建容器后则使用镜像内置的最新版本。Dockerfile 中的版本仅作为本地构建时的兜底值。cloudflared 自更新会重启 Tunnel，单连接可能产生短暂重连。
@@ -95,6 +117,8 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | DIRECT_CERT_FILE | 直连模式二选一 | - | 已有 TLS 证书路径，需与 `DIRECT_KEY_FILE` 同时配置 |
 | DIRECT_KEY_FILE | 直连模式二选一 | - | 已有 TLS 私钥路径，需与 `DIRECT_CERT_FILE` 同时配置 |
 | DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | admin@lemon.vin | Let's Encrypt 邮箱；可覆盖默认值，与上面证书路径二选一 |
+| PLATFORM_PROXY_MODE | 否 | false | 是否启用平台边缘代理模式；启用后复用 `ARGO_PORT`，不启动 cloudflared、Nginx 或 Certbot |
+| PLATFORM_PUBLIC_PORT | 平台代理模式可选 | 443 | 平台外部 HTTPS 端口，仅用于生成节点链接，容器入口仍使用 `ARGO_PORT` |
 | CF_API_TOKEN | 否 | - | 直连模式 Cloudflare DNS 自动解析 Token，需 Zone Read + DNS Write |
 | CF_DNS_ZONE_ID | 否 | 自动推断 | Cloudflare Zone ID |
 | CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称，复杂域名后缀时填写 |
