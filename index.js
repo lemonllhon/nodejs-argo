@@ -12,6 +12,8 @@ const AUTO_ACCESS = process.env.AUTO_ACCESS || false; // 是否开启自动保�
 const FILE_PATH = process.env.FILE_PATH || ".tmp"; // 运行目录，也是订阅文件保存目录
 const SUB_PATH = process.env.SUB_PATH || "sub"; // 订阅路径
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000; // HTTP 服务监听端口
+const XRAY_LOG_LEVEL = process.env.XRAY_LOG_LEVEL || "warning";
+const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
 const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
 const NEZHA_SERVER = process.env.NEZHA_SERVER || ""; // 哪吒 v1 格式：nz.abc.com:8008；v0 格式：nz.abc.com
 const NEZHA_PORT = process.env.NEZHA_PORT || ""; // 使用哪吒 v1 时留空，使用 v0 时填写
@@ -59,6 +61,9 @@ const subPath = path.join(FILE_PATH, "sub.txt");
 const listPath = path.join(FILE_PATH, "list.txt");
 const bootLogPath = path.join(FILE_PATH, "boot.log");
 const configPath = path.join(FILE_PATH, "config.json");
+const xrayAccessLogPath = path.join(FILE_PATH, "xray-access.log");
+const xrayErrorLogPath = path.join(FILE_PATH, "xray-error.log");
+const cloudflaredLogPath = path.join(FILE_PATH, "cloudflared.log");
 const nezhaConfigPath = path.join(FILE_PATH, "config.yaml");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
@@ -592,7 +597,7 @@ function cleanupOldFiles() {
 // 生成 Xray 配置文件
 async function generateConfig() {
   const config = {
-    log: { access: "/dev/null", error: "/dev/null", loglevel: "none" },
+    log: { access: xrayAccessLogPath, error: xrayErrorLogPath, loglevel: XRAY_LOG_LEVEL },
     inbounds: [
       {
         port: ARGO_PORT,
@@ -676,11 +681,11 @@ function authorizeFiles(filePaths) {
 // 根据认证方式生成 cloudflared 启动参数
 function buildCloudflaredArgs() {
   if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 run --token ${ARGO_AUTH}`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run --token ${ARGO_AUTH}`;
   }
 
   if (ARGO_AUTH.match(/TunnelSecret/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" run`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run`;
   }
 
   return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;

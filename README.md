@@ -28,6 +28,10 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。容器运行期间，cloudflared 也会每 24 小时自动检查并更新自身；重新创建容器后则使用镜像内置的最新版本。Dockerfile 中的版本仅作为本地构建时的兜底值。cloudflared 自更新会重启 Tunnel，单连接可能产生短暂重连。
 
+### 运行日志
+
+Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`。可通过 `XRAY_LOG_LEVEL` 与 `CLOUDFLARED_LOG_LEVEL` 调整日志级别；容器启动时会清理运行目录中的历史文件。
+
 ## 📋 环境变量
 
 | 变量名 | 是否必须 | 默认值 | 说明 |
