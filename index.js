@@ -4,6 +4,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const net = require("net");
 const { promisify } = require("util");
 const exec = promisify(require("child_process").exec);
 const UPLOAD_URL = process.env.UPLOAD_URL || ""; // 节点或订阅自动上传地址，例如：https://merge.xxx.com
@@ -14,6 +15,7 @@ const SUB_PATH = process.env.SUB_PATH || "sub"; // 订阅路径
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000; // HTTP 服务监听端口
 const XRAY_LOG_LEVEL = process.env.XRAY_LOG_LEVEL || "warning";
 const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
+const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
 const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
 const NEZHA_SERVER = process.env.NEZHA_SERVER || ""; // 哪吒 v1 格式：nz.abc.com:8008；v0 格式：nz.abc.com
 const NEZHA_PORT = process.env.NEZHA_PORT || ""; // 使用哪吒 v1 时留空，使用 v0 时填写
@@ -21,8 +23,21 @@ const NEZHA_KEY = process.env.NEZHA_KEY || ""; // 哪吒 v1 的 NZ_CLIENT_SECRET
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || ""; // 固定隧道域名，留空则启用临时隧道
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
-const CFIP = process.env.CFIP || "www.cloudflare.com"; // 节点优选域名或优选 IP
-const CFPORT = process.env.CFPORT || 443; // 节点优选域名或优选 IP 对应端口
+const DIRECT_MODE = parseBoolean(process.env.DIRECT_MODE, false);
+const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
+const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 10);
+const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
+const DIRECT_KEY_FILE = process.env.DIRECT_KEY_FILE || "";
+const DIRECT_LETSENCRYPT_EMAIL = process.env.DIRECT_LETSENCRYPT_EMAIL || "";
+const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
+const CF_DNS_ZONE_ID = process.env.CF_DNS_ZONE_ID || "";
+const CF_DNS_ZONE_NAME = process.env.CF_DNS_ZONE_NAME || "";
+const CF_DNS_RECORD_NAME = process.env.CF_DNS_RECORD_NAME || ARGO_DOMAIN;
+const CF_DNS_PUBLIC_IP = process.env.CF_DNS_PUBLIC_IP || "";
+const CF_DNS_TTL = Number.parseInt(process.env.CF_DNS_TTL || "120", 10);
+const CF_DNS_SYNC_INTERVAL_MS = Number.parseInt(process.env.CF_DNS_SYNC_INTERVAL_MS || "300000", 10);
+const CFIP = process.env.CFIP || (DIRECT_MODE ? ARGO_DOMAIN : "www.cloudflare.com"); // 节点优选域名或优选 IP
+const CFPORT = process.env.CFPORT || (DIRECT_MODE ? DIRECT_PORT : 443); // 节点优选域名或优选 IP 对应端口
 const NAME = process.env.NAME || ""; // 节点名称前缀
 const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
 const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
@@ -64,14 +79,23 @@ const configPath = path.join(FILE_PATH, "config.json");
 const xrayAccessLogPath = path.join(FILE_PATH, "xray-access.log");
 const xrayErrorLogPath = path.join(FILE_PATH, "xray-error.log");
 const cloudflaredLogPath = path.join(FILE_PATH, "cloudflared.log");
+const directNginxConfigPath = path.join(FILE_PATH, "nginx-direct.conf");
+const directNginxAccessLogPath = path.join(FILE_PATH, "nginx-access.log");
+const directNginxErrorLogPath = path.join(FILE_PATH, "nginx-error.log");
+const directNginxPidPath = path.join(FILE_PATH, "nginx.pid");
+const directAcmePath = path.join(FILE_PATH, "acme");
 const nezhaConfigPath = path.join(FILE_PATH, "config.yaml");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
+const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
+const CERTBOT_BIN = process.env.CERTBOT_BIN || "/usr/bin/certbot";
 
 let teamnodeSyncTimer = null;
 let teamnodeSyncRegistered = false;
 let teamnodeSyncContext = null;
 let teamnodeShutdownPromise = null;
+let directCertificateRenewalTimer = null;
+let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
 let bootInstanceId = createRandomToken();
 const PROVIDER_CODE_OVERRIDES = {
@@ -577,12 +601,17 @@ function deleteNodes() {
 // 清理运行目录里的历史文件
 function cleanupOldFiles() {
   try {
+    const preservedFiles = new Set(
+      [DIRECT_CERT_FILE, DIRECT_KEY_FILE]
+        .filter(Boolean)
+        .map((filePath) => path.resolve(filePath))
+    );
     const files = fs.readdirSync(FILE_PATH);
     files.forEach((file) => {
       const filePath = path.join(FILE_PATH, file);
       try {
         const stat = fs.statSync(filePath);
-        if (stat.isFile()) {
+        if (stat.isFile() && !preservedFiles.has(path.resolve(filePath))) {
           fs.unlinkSync(filePath);
         }
       } catch {
@@ -601,6 +630,7 @@ async function generateConfig() {
     inbounds: [
       {
         port: ARGO_PORT,
+        listen: DIRECT_MODE ? "127.0.0.1" : undefined,
         protocol: "vless",
         settings: {
           clients: [{ id: UUID, flow: "xtls-rprx-vision" }],
@@ -678,6 +708,387 @@ function authorizeFiles(filePaths) {
   });
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function isValidPort(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+function validateDirectMode() {
+  if (!DIRECT_MODE) return;
+
+  const domain = String(ARGO_DOMAIN || "").trim();
+  const hostnamePattern = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
+
+  if (!hostnamePattern.test(domain)) {
+    throw new Error("DIRECT_MODE=true 时 ARGO_DOMAIN 必须是有效的域名，例如 justrunmy.lemon.vin");
+  }
+
+  if (!isValidPort(DIRECT_PORT) || !isValidPort(DIRECT_HTTP_PORT)) {
+    throw new Error("DIRECT_PORT 和 DIRECT_HTTP_PORT 必须是 1-65535 之间的端口");
+  }
+
+  if (DIRECT_PORT === DIRECT_HTTP_PORT) {
+    throw new Error("DIRECT_PORT 和 DIRECT_HTTP_PORT 不能使用同一个端口");
+  }
+
+  if (Boolean(DIRECT_CERT_FILE) !== Boolean(DIRECT_KEY_FILE)) {
+    throw new Error("DIRECT_CERT_FILE 和 DIRECT_KEY_FILE 必须同时配置，或同时留空");
+  }
+}
+
+function nginxConfigValue(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function getDirectCertificatePaths() {
+  if (DIRECT_CERT_FILE && DIRECT_KEY_FILE) {
+    return {
+      certificateFile: path.resolve(DIRECT_CERT_FILE),
+      keyFile: path.resolve(DIRECT_KEY_FILE),
+      managedByCertbot: false
+    };
+  }
+
+  return {
+    certificateFile: path.join("/etc/letsencrypt/live", ARGO_DOMAIN, "fullchain.pem"),
+    keyFile: path.join("/etc/letsencrypt/live", ARGO_DOMAIN, "privkey.pem"),
+    managedByCertbot: true
+  };
+}
+
+function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly = false } = {}) {
+  const domain = String(ARGO_DOMAIN).trim();
+  const runtimePidPath = path.resolve(directNginxPidPath);
+  const runtimeAcmePath = path.resolve(directAcmePath);
+  const accessLogPath = path.resolve(directNginxAccessLogPath);
+  const errorLogPath = path.resolve(directNginxErrorLogPath);
+  const httpsPortSuffix = DIRECT_PORT === 443 ? "" : `:${DIRECT_PORT}`;
+  const proxyHeaders = [
+    "proxy_http_version 1.1;",
+    "proxy_set_header Upgrade $http_upgrade;",
+    "proxy_set_header Connection $connection_upgrade;",
+    "proxy_set_header Host $host;",
+    "proxy_set_header X-Real-IP $remote_addr;",
+    "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    "proxy_set_header X-Forwarded-Proto $scheme;",
+    "proxy_read_timeout 86400s;",
+    "proxy_send_timeout 86400s;",
+    "proxy_buffering off;"
+  ];
+
+  const lines = [
+    "worker_processes 1;",
+    `pid ${nginxConfigValue(runtimePidPath)};`,
+    `error_log ${nginxConfigValue(errorLogPath)} ${NGINX_LOG_LEVEL};`,
+    "events {",
+    "  worker_connections 1024;",
+    "}",
+    "http {",
+    "  include /etc/nginx/mime.types;",
+    "  default_type application/octet-stream;",
+    "  sendfile on;",
+    "  map $http_upgrade $connection_upgrade {",
+    "    default upgrade;",
+    "    '' close;",
+    "  }",
+    `  access_log ${nginxConfigValue(accessLogPath)} combined;`,
+    "",
+    "  server {",
+    `    listen ${DIRECT_HTTP_PORT};`,
+    `    server_name ${domain};`,
+    "",
+    "    location ^~ /.well-known/acme-challenge/ {",
+    `      root ${nginxConfigValue(runtimeAcmePath)};`,
+    "      try_files $uri =404;",
+    "    }",
+    "",
+    "    location / {",
+    `      return 301 https://$host${httpsPortSuffix}$request_uri;`,
+    "    }",
+    "  }"
+  ];
+
+  if (!httpOnly) {
+    lines.push(
+      "",
+      "  server {",
+      `    listen ${DIRECT_PORT} ssl;`,
+      `    server_name ${domain};`,
+      `    ssl_certificate ${nginxConfigValue(path.resolve(certificateFile))};`,
+      `    ssl_certificate_key ${nginxConfigValue(path.resolve(keyFile))};`,
+      "    ssl_protocols TLSv1.2 TLSv1.3;",
+      "    ssl_session_cache shared:SSL:10m;",
+      "    ssl_session_timeout 10m;",
+      "",
+      "    location = /vless-argo {",
+      "      proxy_pass http://127.0.0.1:3002;",
+      ...proxyHeaders.map((line) => `      ${line}`),
+      "    }",
+      "",
+      "    location = /vmess-argo {",
+      "      proxy_pass http://127.0.0.1:3003;",
+      ...proxyHeaders.map((line) => `      ${line}`),
+      "    }",
+      "",
+      "    location = /trojan-argo {",
+      "      proxy_pass http://127.0.0.1:3004;",
+      ...proxyHeaders.map((line) => `      ${line}`),
+      "    }",
+      "",
+      "    location / {",
+      "      proxy_pass http://127.0.0.1:3000;",
+      ...proxyHeaders.map((line) => `      ${line}`),
+      "    }",
+      "  }"
+    );
+  }
+
+  lines.push("}", "");
+  return lines.join("\n");
+}
+
+function writeDirectNginxConfig(options = {}) {
+  fs.mkdirSync(directAcmePath, { recursive: true });
+  fs.writeFileSync(directNginxConfigPath, buildDirectNginxConfig(options));
+}
+
+async function stopDirectNginx() {
+  try {
+    await exec(`${shellQuote(NGINX_BIN)} -c ${shellQuote(path.resolve(directNginxConfigPath))} -s stop`);
+  } catch {
+    // 证书申请前可能还没有 Nginx 进程，忽略停止失败。
+  }
+}
+
+async function startNginx() {
+  const config = path.resolve(directNginxConfigPath);
+  await exec(`${shellQuote(NGINX_BIN)} -t -c ${shellQuote(config)}`);
+  await exec(`nohup ${shellQuote(NGINX_BIN)} -c ${shellQuote(config)} >/dev/null 2>&1 &`);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+}
+
+async function ensureDirectCertificate() {
+  const certificate = getDirectCertificatePaths();
+  const certificateExists = fs.existsSync(certificate.certificateFile);
+  const keyExists = fs.existsSync(certificate.keyFile);
+
+  if (certificateExists && keyExists) {
+    return certificate;
+  }
+
+  if (DIRECT_CERT_FILE || DIRECT_KEY_FILE) {
+    throw new Error(`直连模式证书文件不存在：${certificate.certificateFile} 或 ${certificate.keyFile}`);
+  }
+
+  if (!DIRECT_LETSENCRYPT_EMAIL) {
+    throw new Error("直连模式需要证书：请配置 DIRECT_CERT_FILE/DIRECT_KEY_FILE，或配置 DIRECT_LETSENCRYPT_EMAIL 自动申请 Let's Encrypt 证书");
+  }
+
+  writeDirectNginxConfig({ httpOnly: true });
+  await startNginx();
+  try {
+    const webroot = path.resolve(directAcmePath);
+    const certbotArgs = [
+      "certonly",
+      "--webroot",
+      "--webroot-path",
+      webroot,
+      "--domain",
+      ARGO_DOMAIN,
+      "--email",
+      DIRECT_LETSENCRYPT_EMAIL,
+      "--agree-tos",
+      "--non-interactive",
+      "--keep-until-expiring",
+      "--no-eff-email"
+    ].map(shellQuote).join(" ");
+    await exec(`${shellQuote(CERTBOT_BIN)} ${certbotArgs}`);
+  } finally {
+    await stopDirectNginx();
+  }
+
+  if (!fs.existsSync(certificate.certificateFile) || !fs.existsSync(certificate.keyFile)) {
+    throw new Error(`Let's Encrypt 申请完成后仍未找到证书：${certificate.certificateFile}`);
+  }
+
+  return certificate;
+}
+
+function startDirectCertificateRenewal() {
+  if (directCertificateRenewalTimer || !DIRECT_LETSENCRYPT_EMAIL || DIRECT_CERT_FILE || DIRECT_KEY_FILE) {
+    return;
+  }
+
+  directCertificateRenewalTimer = setInterval(async () => {
+    try {
+      await exec(`${shellQuote(CERTBOT_BIN)} renew --quiet`);
+      await exec(`${shellQuote(NGINX_BIN)} -c ${shellQuote(path.resolve(directNginxConfigPath))} -s reload`);
+      console.log("直连模式证书续期检查完成，Nginx 已重新加载");
+    } catch (error) {
+      console.error(`直连模式证书续期失败：${error.message}`);
+    }
+  }, 12 * 60 * 60 * 1000);
+
+  if (typeof directCertificateRenewalTimer.unref === "function") {
+    directCertificateRenewalTimer.unref();
+  }
+}
+
+function getCloudflareApiClient() {
+  return axios.create({
+    baseURL: "https://api.cloudflare.com/client/v4",
+    timeout: 10000,
+    headers: {
+      Authorization: `Bearer ${CF_API_TOKEN}`,
+      "Content-Type": "application/json"
+    }
+  });
+}
+
+function getCloudflareZoneName() {
+  if (CF_DNS_ZONE_NAME) return CF_DNS_ZONE_NAME;
+
+  const labels = String(ARGO_DOMAIN).trim().split(".").filter(Boolean);
+  return labels.length >= 2 ? labels.slice(-2).join(".") : "";
+}
+
+async function resolveCloudflareZoneId(client) {
+  if (CF_DNS_ZONE_ID) return CF_DNS_ZONE_ID;
+
+  const zoneName = getCloudflareZoneName();
+  if (!zoneName) {
+    throw new Error("无法从 ARGO_DOMAIN 推断 Cloudflare Zone，请配置 CF_DNS_ZONE_NAME 或 CF_DNS_ZONE_ID");
+  }
+
+  const response = await client.get("/zones", {
+    params: { name: zoneName, status: "active", per_page: 1 }
+  });
+  const zones = response.data && response.data.result;
+  if (!response.data || !response.data.success || !Array.isArray(zones) || zones.length === 0) {
+    throw new Error(`Cloudflare Zone 不存在或 API Token 没有 Zone:Read 权限：${zoneName}`);
+  }
+
+  return zones[0].id;
+}
+
+async function resolvePublicIpv4() {
+  if (CF_DNS_PUBLIC_IP) return CF_DNS_PUBLIC_IP.trim();
+
+  const response = await axios.get("https://api.ipify.org?format=json", { timeout: 8000 });
+  const publicIp = response.data && response.data.ip;
+  if (!publicIp || net.isIP(publicIp) !== 4) {
+    throw new Error("公网 IP 查询结果不是有效的 IPv4 地址，请配置 CF_DNS_PUBLIC_IP");
+  }
+
+  return String(publicIp).trim();
+}
+
+async function syncCloudflareDnsRecord() {
+  if (!DIRECT_MODE || !CF_API_TOKEN) {
+    if (DIRECT_MODE) {
+      console.log("未配置 CF_API_TOKEN，跳过 Cloudflare DNS 自动解析；请确认 ARGO_DOMAIN 已指向本机公网 IP");
+    }
+    return;
+  }
+
+  if (
+    !CF_DNS_RECORD_NAME ||
+    !Number.isInteger(CF_DNS_TTL) ||
+    CF_DNS_TTL < 1 ||
+    CF_DNS_TTL > 86400
+  ) {
+    throw new Error("CF_DNS_RECORD_NAME 不能为空，CF_DNS_TTL 必须是有效的 TTL 秒数");
+  }
+
+  const client = getCloudflareApiClient();
+  const zoneId = await resolveCloudflareZoneId(client);
+  const publicIp = await resolvePublicIpv4();
+  if (net.isIP(publicIp) !== 4) {
+    throw new Error(`CF_DNS_PUBLIC_IP 不是有效的 IPv4 地址：${publicIp}`);
+  }
+
+  const listResponse = await client.get(`/zones/${zoneId}/dns_records`, {
+    params: { name: CF_DNS_RECORD_NAME, per_page: 100 }
+  });
+  if (!listResponse.data || !listResponse.data.success) {
+    throw new Error("Cloudflare DNS 记录查询失败，请检查 API Token 权限");
+  }
+
+  const records = Array.isArray(listResponse.data.result) ? listResponse.data.result : [];
+  const current = records.find((record) => record.type === "A");
+  const conflictingRecord = records.find((record) => record.type !== "A");
+  if (!current && conflictingRecord) {
+    throw new Error(`Cloudflare DNS 中已存在 ${CF_DNS_RECORD_NAME} 的 ${conflictingRecord.type} 记录，请先处理冲突后再启用自动解析`);
+  }
+  const desired = {
+    type: "A",
+    name: CF_DNS_RECORD_NAME,
+    content: publicIp,
+    ttl: Number.isInteger(CF_DNS_TTL) && CF_DNS_TTL >= 1 ? CF_DNS_TTL : 120,
+    proxied: false
+  };
+
+  if (
+    current &&
+    current.content === desired.content &&
+    current.proxied === desired.proxied &&
+    current.ttl === desired.ttl
+  ) {
+    console.log(`Cloudflare DNS 已是最新：${CF_DNS_RECORD_NAME} -> ${publicIp}（DNS-only）`);
+    return;
+  }
+
+  if (current) {
+    const updateResponse = await client.put(`/zones/${zoneId}/dns_records/${current.id}`, {
+      ...desired
+    });
+    if (!updateResponse.data || !updateResponse.data.success) {
+      throw new Error("Cloudflare DNS 记录更新失败");
+    }
+    console.log(`Cloudflare DNS 已更新：${CF_DNS_RECORD_NAME} -> ${publicIp}（DNS-only）`);
+    return;
+  }
+
+  const createResponse = await client.post(`/zones/${zoneId}/dns_records`, {
+    ...desired
+  });
+  if (!createResponse.data || !createResponse.data.success) {
+    throw new Error("Cloudflare DNS 记录创建失败");
+  }
+  console.log(`Cloudflare DNS 已创建：${CF_DNS_RECORD_NAME} -> ${publicIp}（DNS-only）`);
+}
+
+function startCloudflareDnsSyncLoop() {
+  if (cloudflareDnsSyncTimer || !DIRECT_MODE || !CF_API_TOKEN) {
+    return;
+  }
+
+  const interval = Number.isInteger(CF_DNS_SYNC_INTERVAL_MS) && CF_DNS_SYNC_INTERVAL_MS >= 60000
+    ? CF_DNS_SYNC_INTERVAL_MS
+    : 300000;
+
+  cloudflareDnsSyncTimer = setInterval(() => {
+    syncCloudflareDnsRecord().catch((error) => {
+      console.error(`Cloudflare DNS 自动解析检查失败：${error.message}`);
+    });
+  }, interval);
+
+  if (typeof cloudflareDnsSyncTimer.unref === "function") {
+    cloudflareDnsSyncTimer.unref();
+  }
+}
+
+async function startDirectGateway() {
+  validateDirectMode();
+  const certificate = await ensureDirectCertificate();
+  writeDirectNginxConfig(certificate);
+  await startNginx();
+  startDirectCertificateRenewal();
+}
+
 // 根据认证方式生成 cloudflared 启动参数
 function buildCloudflaredArgs() {
   if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
@@ -695,8 +1106,10 @@ function buildCloudflaredArgs() {
 async function startProcesses() {
   try {
     ensureBinaryExists(webPath, "xray");
-    ensureBinaryExists(botPath, "cloudflared");
-    authorizeFiles([webPath, botPath]);
+    if (!DIRECT_MODE) {
+      ensureBinaryExists(botPath, "cloudflared");
+    }
+    authorizeFiles(DIRECT_MODE ? [webPath] : [webPath, botPath]);
   } catch (error) {
     console.error(`二进制检查失败：${error.message}`);
     throw error;
@@ -769,13 +1182,23 @@ uuid: ${UUID}`;
     console.error(`Xray 启动失败：${error}`);
   }
 
-  try {
-    const args = buildCloudflaredArgs();
-    await exec(`nohup "${botPath}" ${args} >/dev/null 2>&1 &`);
-    console.log(`${botName} 已启动`);
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  } catch (error) {
-    console.error(`cloudflared 启动失败：${error}`);
+  if (DIRECT_MODE) {
+    try {
+      await startDirectGateway();
+      console.log(`直连模式已启动：${ARGO_DOMAIN}:${DIRECT_PORT}，HTTP ${DIRECT_HTTP_PORT} 用于证书验证和跳转`);
+    } catch (error) {
+      console.error(`直连网关启动失败：${error.message}`);
+      throw error;
+    }
+  } else {
+    try {
+      const args = buildCloudflaredArgs();
+      await exec(`nohup "${botPath}" ${args} >/dev/null 2>&1 &`);
+      console.log(`${botName} 已启动`);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    } catch (error) {
+      console.error(`cloudflared 启动失败：${error}`);
+    }
   }
 
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -783,6 +1206,11 @@ uuid: ${UUID}`;
 
 // 生成固定隧道配置文件
 function argoType() {
+  if (DIRECT_MODE) {
+    console.log("DIRECT_MODE 已启用，不启动 Cloudflare Tunnel");
+    return;
+  }
+
   if (!ARGO_AUTH || !ARGO_DOMAIN) {
     console.log("ARGO_DOMAIN 或 ARGO_AUTH 为空，将使用临时隧道");
     return;
@@ -811,6 +1239,13 @@ function argoType() {
 // 从日志中提取临时隧道域名
 async function extractDomains() {
   let argoDomain;
+
+  if (DIRECT_MODE) {
+    argoDomain = ARGO_DOMAIN;
+    console.log("直连域名:", argoDomain);
+    await generateLinks(argoDomain);
+    return;
+  }
 
   if (ARGO_AUTH && ARGO_DOMAIN) {
     argoDomain = ARGO_DOMAIN;
@@ -927,14 +1362,16 @@ async function generateLinks(argoDomain) {
   const ipRiskSuffix = buildIpRiskNodeSuffix(ipRiskInfo);
   const baseNodeName = buildDefaultNodeName(metaInfo);
   const nodeName = ipRiskSuffix ? `${baseNodeName}-${ipRiskSuffix}` : baseNodeName;
+  const nodeAddress = DIRECT_MODE ? ARGO_DOMAIN : CFIP;
+  const nodePort = DIRECT_MODE ? DIRECT_PORT : CFPORT;
 
   return new Promise((resolve) => {
     setTimeout(() => {
       const VMESS = {
         v: "2",
         ps: `${nodeName}`,
-        add: CFIP,
-        port: CFPORT,
+        add: nodeAddress,
+        port: nodePort,
         id: UUID,
         aid: "0",
         scy: "auto",
@@ -949,11 +1386,11 @@ async function generateLinks(argoDomain) {
       };
 
       const subTxt = `
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
+vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
 
 vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}
 
-trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
+trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
       `;
 
       const contentBase64 = Buffer.from(subTxt).toString("base64");
@@ -1084,6 +1521,9 @@ async function AddVisitTask() {
 // 主启动流程
 async function startserver() {
   try {
+    validateDirectMode();
+    await syncCloudflareDnsRecord();
+    startCloudflareDnsSyncLoop();
     deleteNodes();
     cleanupOldFiles();
     argoType();

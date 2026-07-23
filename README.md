@@ -24,6 +24,45 @@ Telegram交流反馈群组：https://t.me/eooceu
 * 不填写ARGO_DOMAIN和ARGO_AUTH两个变量即启用临时隧道，反之则使用固定隧道。
 * 哪吒v0/v1可选,当哪吒端口为{443,8443,2096,2087,2083,2053}其中之一时，自动开启tls。
 
+### 直连模式（绕过 Cloudflare Tunnel）
+
+如果 Cloudflare 边缘节点拦截 WebSocket，或希望节点直接连接 Docker 主机，可以设置 `DIRECT_MODE=true`。此模式使用 Nginx 接收 HTTPS，再把三个 WebSocket 路径转发给容器内的 Xray，同时保留根路径网页。
+
+直连模式不需要 `ARGO_AUTH`、`CFIP` 或用户配置的 `ARGO_PORT`。请将 `ARGO_DOMAIN` 的 DNS A/AAAA 记录直接指向服务器公网 IP，并在 Docker 主机发布 80、443 端口；如果 DNS 仍然是 Cloudflare 橙云，流量仍会经过 Cloudflare。
+
+证书有两种方式：
+
+* 配置 `DIRECT_CERT_FILE` 和 `DIRECT_KEY_FILE`，挂载已有证书；
+* 配置 `DIRECT_LETSENCRYPT_EMAIL`，容器会通过 80 端口自动申请并每 12 小时检查续期。
+
+如果希望容器自动维护 Cloudflare DNS，再配置一个只允许目标 Zone 使用的 API Token：
+
+* `CF_API_TOKEN`：Cloudflare API Token，权限建议为目标 Zone 的 `Zone Read` 和 `DNS Write`；
+* `CF_DNS_ZONE_ID`：可选，填写后不需要自动推断 Zone；
+* `CF_DNS_ZONE_NAME`：可选，复杂后缀域名可以显式填写，例如 `lemon.vin`；
+* `CF_DNS_PUBLIC_IP`：可选，默认通过公网服务自动获取本机 IPv4；
+* `CF_DNS_RECORD_NAME`：可选，默认使用 `ARGO_DOMAIN`；
+* `CF_DNS_TTL`：可选，默认 120 秒；
+* `CF_DNS_SYNC_INTERVAL_MS`：可选，默认 300000（5 分钟），公网 IP 变化后的检查间隔，最小 60000。
+
+启用 `DIRECT_MODE=true` 且配置 `CF_API_TOKEN` 后，启动时会自动创建或更新 `ARGO_DOMAIN` 的 A 记录，并强制设置为 DNS-only（灰云），避免再次经过 Cloudflare WebSocket 边缘。Token 不会写入日志。
+
+示例（自动申请 Let's Encrypt 证书）：
+
+```bash
+docker run -d --name lemon-node --restart unless-stopped \
+  -p 80:80 -p 443:443 \
+  -v /srv/lemon-node/letsencrypt:/etc/letsencrypt \
+  -e DIRECT_MODE=true \
+  -e ARGO_DOMAIN=justrunmy.lemon.vin \
+  -e DIRECT_LETSENCRYPT_EMAIL=you@example.com \
+  -e CF_API_TOKEN=你的Cloudflare_DNS_API_Token \
+  -e UUID=你的UUID \
+  ghcr.io/lemonllhon/nodejs:latest
+```
+
+直连模式生成的 VLESS、VMess、Trojan 节点地址统一为 `ARGO_DOMAIN:DIRECT_PORT`，其中 `DIRECT_PORT` 默认是 443，`DIRECT_HTTP_PORT` 默认是 80。原有 Cloudflare Tunnel 模式保持不变。
+
 ### Docker 镜像中的 cloudflared 自动更新
 
 GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。容器运行期间，cloudflared 也会每 24 小时自动检查并更新自身；重新创建容器后则使用镜像内置的最新版本。Dockerfile 中的版本仅作为本地构建时的兜底值。cloudflared 自更新会重启 Tunnel，单连接可能产生短暂重连。
@@ -49,6 +88,19 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | ARGO_AUTH | 否 | - | Argo固定隧道密钥 |
 | CFIP | 否 | www.cloudflare.com | 节点优选域名或IP |
 | CFPORT | 否 | 443 | 节点端口 |
+| DIRECT_MODE | 否 | false | 是否启用直连模式；启用后不启动 cloudflared |
+| DIRECT_PORT | 否 | 443 | 直连 HTTPS 和节点端口 |
+| DIRECT_HTTP_PORT | 否 | 80 | 直连 HTTP 端口，用于 ACME 验证和跳转 |
+| DIRECT_CERT_FILE | 直连模式二选一 | - | 已有 TLS 证书路径，需与 `DIRECT_KEY_FILE` 同时配置 |
+| DIRECT_KEY_FILE | 直连模式二选一 | - | 已有 TLS 私钥路径，需与 `DIRECT_CERT_FILE` 同时配置 |
+| DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | - | Let's Encrypt 邮箱；与上面证书路径二选一 |
+| CF_API_TOKEN | 否 | - | 直连模式 Cloudflare DNS 自动解析 Token，需 Zone Read + DNS Write |
+| CF_DNS_ZONE_ID | 否 | 自动推断 | Cloudflare Zone ID |
+| CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称，复杂域名后缀时填写 |
+| CF_DNS_RECORD_NAME | 否 | ARGO_DOMAIN | 自动维护的 A 记录名称 |
+| CF_DNS_PUBLIC_IP | 否 | 自动获取 | 指定要写入 DNS 的公网 IPv4 |
+| CF_DNS_TTL | 否 | 120 | DNS TTL 秒数，范围 1-86400 |
+| CF_DNS_SYNC_INTERVAL_MS | 否 | 300000 | 自动解析检查间隔，最小 60000 毫秒 |
 | NAME | 否 | Vls | 节点名称前缀 |
 | FILE_PATH | 否 | ./tmp | 运行目录 |
 | SUB_PATH | 否 | sub | 订阅路径 |
