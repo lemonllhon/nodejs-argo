@@ -1,7 +1,9 @@
 FROM --platform=$BUILDPLATFORM alpine:3.20 AS downloader
 
 ARG TARGETARCH
-ARG CLOUDFLARED_VERSION=2026.2.0
+# The CI workflow resolves the latest stable release and passes it at build
+# time. Keep a recent version here as a fallback for local docker builds.
+ARG CLOUDFLARED_VERSION=2026.7.2
 ARG XRAY_VERSION=v26.3.27
 ARG NEZHA_AGENT_VERSION=v1.14.1
 

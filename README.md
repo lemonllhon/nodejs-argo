@@ -24,6 +24,10 @@ Telegram交流反馈群组：https://t.me/eooceu
 * 不填写ARGO_DOMAIN和ARGO_AUTH两个变量即启用临时隧道，反之则使用固定隧道。
 * 哪吒v0/v1可选,当哪吒端口为{443,8443,2096,2087,2083,2053}其中之一时，自动开启tls。
 
+### Docker 镜像中的 cloudflared 自动更新
+
+GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。因此重新部署前执行 `docker pull` 即可获取更新后的内置 cloudflared；Dockerfile 中的版本仅作为本地构建时的兜底值。
+
 ## 📋 环境变量
 
 | 变量名 | 是否必须 | 默认值 | 说明 |
