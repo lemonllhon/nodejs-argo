@@ -186,8 +186,6 @@ function createTeamNodeSyncHeaders({ method = "GET", path: requestPath = "/", ra
 function isTeamNodeSyncConfigured() {
   return Boolean(
     TEAMNODE_SYNC_ENABLED
-    && ARGO_DOMAIN
-    && ARGO_AUTH
     && normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL)
     && TEAMNODE_SYNC_KEY_ID
     && TEAMNODE_SYNC_SECRET
