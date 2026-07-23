@@ -43,7 +43,7 @@ GitHub Actions 会在每日定时构建、推送代码变更或手动执行工�
 | NEZHA_KEY | 否 | - | 哪吒密钥 |
 | ARGO_DOMAIN | 否 | - | Argo固定隧道域名 |
 | ARGO_AUTH | 否 | - | Argo固定隧道密钥 |
-| CFIP | 否 | www.visa.com.tw | 节点优选域名或IP |
+| CFIP | 否 | www.cloudflare.com | 节点优选域名或IP |
 | CFPORT | 否 | 443 | 节点端口 |
 | NAME | 否 | Vls | 节点名称前缀 |
 | FILE_PATH | 否 | ./tmp | 运行目录 |
