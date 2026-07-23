@@ -42,7 +42,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 * `CF_DNS_ZONE_ID`：可选，填写后不需要自动推断 Zone；
 * `CF_DNS_ZONE_NAME`：可选，复杂后缀域名可以显式填写，例如 `lemon.vin`；
 * `CF_DNS_PUBLIC_IP`：可选，默认通过公网服务自动获取本机 IPv4；
-* `CF_DNS_RECORD_NAME`：可选，默认使用 `ARGO_DOMAIN`；
+* `CF_DNS_RECORD_NAME`：可选，默认使用 `ARGO_DOMAIN`；启用 `CF_DNS_ENABLED=true` 时必须与 `ARGO_DOMAIN` 一致；关闭时不生效；
 * `CF_DNS_TTL`：可选，默认 120 秒；
 * `CF_DNS_SYNC_INTERVAL_MS`：可选，默认 300000（5 分钟），公网 IP 变化后的检查间隔，最小 60000；
 * `CF_DNS_REPLACE_CNAME`：可选，默认 `true`，直连切换时自动删除同名 Tunnel CNAME；设置为 `false` 可禁止。
@@ -125,7 +125,7 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | CF_API_TOKEN | 否 | - | 启用 `CF_DNS_ENABLED=true` 后使用的 Cloudflare DNS API Token，需 Zone Read + DNS Write |
 | CF_DNS_ZONE_ID | 否 | 自动推断 | Cloudflare Zone ID |
 | CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称，复杂域名后缀时填写 |
-| CF_DNS_RECORD_NAME | 否 | ARGO_DOMAIN | 自动维护的 A 记录名称 |
+| CF_DNS_RECORD_NAME | 否 | ARGO_DOMAIN | 自动维护的 A 记录名称；启用 DNS 同步时必须与 `ARGO_DOMAIN` 一致，关闭时不生效 |
 | CF_DNS_PUBLIC_IP | 否 | 自动获取 | 指定要写入 DNS 的公网 IPv4 |
 | CF_DNS_TTL | 否 | 120 | DNS TTL 秒数，范围 1-86400 |
 | CF_DNS_SYNC_INTERVAL_MS | 否 | 300000 | 自动解析检查间隔，最小 60000 毫秒 |

@@ -748,6 +748,10 @@ function validatePlatformProxyMode() {
   if (!isValidPort(PLATFORM_PUBLIC_PORT)) {
     throw new Error("PLATFORM_PUBLIC_PORT 必须是 1-65535 之间的端口");
   }
+
+  if (CF_DNS_ENABLED) {
+    throw new Error("PLATFORM_PROXY_MODE=true 时不应启用 CF_DNS_ENABLED；请使用平台提供的域名");
+  }
 }
 
 function validateDirectMode() {
@@ -769,6 +773,22 @@ function validateDirectMode() {
 
   if (Boolean(DIRECT_CERT_FILE) !== Boolean(DIRECT_KEY_FILE)) {
     throw new Error("DIRECT_CERT_FILE 和 DIRECT_KEY_FILE 必须同时配置，或同时留空");
+  }
+}
+
+function validateCloudflareDnsMode() {
+  if (!CF_DNS_ENABLED) return;
+
+  if (!DIRECT_MODE) {
+    throw new Error("CF_DNS_ENABLED=true 只支持 DIRECT_MODE=true；平台代理模式请关闭它并使用平台域名");
+  }
+
+  if (!isValidDomain(CF_DNS_RECORD_NAME)) {
+    throw new Error("CF_DNS_RECORD_NAME 必须是有效的域名");
+  }
+
+  if (String(CF_DNS_RECORD_NAME).trim().toLowerCase() !== String(ARGO_DOMAIN).trim().toLowerCase()) {
+    throw new Error("启用 CF_DNS_ENABLED 时，CF_DNS_RECORD_NAME 必须与 ARGO_DOMAIN 一致");
   }
 }
 
@@ -1571,6 +1591,7 @@ async function startserver() {
   try {
     validateDirectMode();
     validatePlatformProxyMode();
+    validateCloudflareDnsMode();
     await syncCloudflareDnsRecord();
     startCloudflareDnsSyncLoop();
     deleteNodes();
