@@ -33,7 +33,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 证书有两种方式：
 
 * 配置 `DIRECT_CERT_FILE` 和 `DIRECT_KEY_FILE`，挂载已有证书；
-* 配置 `DIRECT_LETSENCRYPT_EMAIL`，容器会通过 80 端口自动申请并每 12 小时检查续期。
+* 配置 `DIRECT_LETSENCRYPT_EMAIL`（默认 `admin@lemon.vin`），容器会通过 80 端口自动申请并每 12 小时检查续期。
 
 如果希望容器自动维护 Cloudflare DNS，再配置一个只允许目标 Zone 使用的 API Token：
 
@@ -94,7 +94,7 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | DIRECT_HTTP_PORT | 否 | 80 | 直连 HTTP 端口，用于 ACME 验证和跳转 |
 | DIRECT_CERT_FILE | 直连模式二选一 | - | 已有 TLS 证书路径，需与 `DIRECT_KEY_FILE` 同时配置 |
 | DIRECT_KEY_FILE | 直连模式二选一 | - | 已有 TLS 私钥路径，需与 `DIRECT_CERT_FILE` 同时配置 |
-| DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | - | Let's Encrypt 邮箱；与上面证书路径二选一 |
+| DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | admin@lemon.vin | Let's Encrypt 邮箱；可覆盖默认值，与上面证书路径二选一 |
 | CF_API_TOKEN | 否 | - | 直连模式 Cloudflare DNS 自动解析 Token，需 Zone Read + DNS Write |
 | CF_DNS_ZONE_ID | 否 | 自动推断 | Cloudflare Zone ID |
 | CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称，复杂域名后缀时填写 |
