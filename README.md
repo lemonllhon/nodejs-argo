@@ -43,7 +43,8 @@ Telegram交流反馈群组：https://t.me/eooceu
 * `CF_DNS_PUBLIC_IP`：可选，默认通过公网服务自动获取本机 IPv4；
 * `CF_DNS_RECORD_NAME`：可选，默认使用 `ARGO_DOMAIN`；
 * `CF_DNS_TTL`：可选，默认 120 秒；
-* `CF_DNS_SYNC_INTERVAL_MS`：可选，默认 300000（5 分钟），公网 IP 变化后的检查间隔，最小 60000。
+* `CF_DNS_SYNC_INTERVAL_MS`：可选，默认 300000（5 分钟），公网 IP 变化后的检查间隔，最小 60000；
+* `CF_DNS_REPLACE_CNAME`：可选，默认 `true`，直连切换时自动删除同名 Tunnel CNAME；设置为 `false` 可禁止。
 
 启用 `DIRECT_MODE=true` 且配置 `CF_API_TOKEN` 后，启动时会自动创建或更新 `ARGO_DOMAIN` 的 A 记录，并强制设置为 DNS-only（灰云），避免再次经过 Cloudflare WebSocket 边缘。Token 不会写入日志。
 
@@ -101,6 +102,7 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | CF_DNS_PUBLIC_IP | 否 | 自动获取 | 指定要写入 DNS 的公网 IPv4 |
 | CF_DNS_TTL | 否 | 120 | DNS TTL 秒数，范围 1-86400 |
 | CF_DNS_SYNC_INTERVAL_MS | 否 | 300000 | 自动解析检查间隔，最小 60000 毫秒 |
+| CF_DNS_REPLACE_CNAME | 否 | true | 是否自动替换同名 Cloudflare Tunnel CNAME |
 | NAME | 否 | Vls | 节点名称前缀 |
 | FILE_PATH | 否 | ./tmp | 运行目录 |
 | SUB_PATH | 否 | sub | 订阅路径 |

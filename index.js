@@ -36,6 +36,7 @@ const CF_DNS_RECORD_NAME = process.env.CF_DNS_RECORD_NAME || ARGO_DOMAIN;
 const CF_DNS_PUBLIC_IP = process.env.CF_DNS_PUBLIC_IP || "";
 const CF_DNS_TTL = Number.parseInt(process.env.CF_DNS_TTL || "120", 10);
 const CF_DNS_SYNC_INTERVAL_MS = Number.parseInt(process.env.CF_DNS_SYNC_INTERVAL_MS || "300000", 10);
+const CF_DNS_REPLACE_CNAME = parseBoolean(process.env.CF_DNS_REPLACE_CNAME, true);
 const CFIP = process.env.CFIP || (DIRECT_MODE ? ARGO_DOMAIN : "www.cloudflare.com"); // 节点优选域名或优选 IP
 const CFPORT = process.env.CFPORT || (DIRECT_MODE ? DIRECT_PORT : 443); // 节点优选域名或优选 IP 对应端口
 const NAME = process.env.NAME || ""; // 节点名称前缀
@@ -1021,7 +1022,15 @@ async function syncCloudflareDnsRecord() {
   const current = records.find((record) => record.type === "A");
   const conflictingRecord = records.find((record) => record.type !== "A");
   if (!current && conflictingRecord) {
-    throw new Error(`Cloudflare DNS 中已存在 ${CF_DNS_RECORD_NAME} 的 ${conflictingRecord.type} 记录，请先处理冲突后再启用自动解析`);
+    if (conflictingRecord.type !== "CNAME" || !CF_DNS_REPLACE_CNAME) {
+      throw new Error(`Cloudflare DNS 中已存在 ${CF_DNS_RECORD_NAME} 的 ${conflictingRecord.type} 记录，请先处理冲突后再启用自动解析`);
+    }
+
+    const deleteResponse = await client.delete(`/zones/${zoneId}/dns_records/${conflictingRecord.id}`);
+    if (!deleteResponse.data || !deleteResponse.data.success) {
+      throw new Error(`Cloudflare DNS CNAME 删除失败：${CF_DNS_RECORD_NAME}`);
+    }
+    console.log(`Cloudflare Tunnel CNAME 已移除，准备切换为直连 A 记录：${CF_DNS_RECORD_NAME}`);
   }
   const desired = {
     type: "A",
