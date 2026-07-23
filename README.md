@@ -35,8 +35,9 @@ Telegram交流反馈群组：https://t.me/eooceu
 * 配置 `DIRECT_CERT_FILE` 和 `DIRECT_KEY_FILE`，挂载已有证书；
 * 配置 `DIRECT_LETSENCRYPT_EMAIL`（默认 `admin@lemon.vin`），容器会通过 80 端口自动申请并每 12 小时检查续期。
 
-如果希望容器自动维护 Cloudflare DNS，再配置一个只允许目标 Zone 使用的 API Token：
+如果希望直连模式自动维护 Cloudflare DNS，先设置 `CF_DNS_ENABLED=true`，再配置一个只允许目标 Zone 使用的 API Token。默认不会调用 Cloudflare DNS API：
 
+* `CF_DNS_ENABLED`：是否启用 Cloudflare DNS 自动解析，默认 `false`；仅在 `DIRECT_MODE=true` 时生效；
 * `CF_API_TOKEN`：Cloudflare API Token，权限建议为目标 Zone 的 `Zone Read` 和 `DNS Write`；
 * `CF_DNS_ZONE_ID`：可选，填写后不需要自动推断 Zone；
 * `CF_DNS_ZONE_NAME`：可选，复杂后缀域名可以显式填写，例如 `lemon.vin`；
@@ -46,7 +47,7 @@ Telegram交流反馈群组：https://t.me/eooceu
 * `CF_DNS_SYNC_INTERVAL_MS`：可选，默认 300000（5 分钟），公网 IP 变化后的检查间隔，最小 60000；
 * `CF_DNS_REPLACE_CNAME`：可选，默认 `true`，直连切换时自动删除同名 Tunnel CNAME；设置为 `false` 可禁止。
 
-启用 `DIRECT_MODE=true` 且配置 `CF_API_TOKEN` 后，启动时会自动创建或更新 `ARGO_DOMAIN` 的 A 记录，并强制设置为 DNS-only（灰云），避免再次经过 Cloudflare WebSocket 边缘。Token 不会写入日志。
+同时启用 `DIRECT_MODE=true`、`CF_DNS_ENABLED=true` 并配置 `CF_API_TOKEN` 后，启动时会自动创建或更新 `ARGO_DOMAIN` 的 A 记录，并强制设置为 DNS-only（灰云），避免再次经过 Cloudflare WebSocket 边缘。Token 不会写入日志。
 
 示例（自动申请 Let's Encrypt 证书）：
 
@@ -57,6 +58,7 @@ docker run -d --name lemon-node --restart unless-stopped \
   -e DIRECT_MODE=true \
   -e ARGO_DOMAIN=justrunmy.lemon.vin \
   -e DIRECT_LETSENCRYPT_EMAIL=you@example.com \
+  -e CF_DNS_ENABLED=true \
   -e CF_API_TOKEN=你的Cloudflare_DNS_API_Token \
   -e UUID=你的UUID \
   ghcr.io/lemonllhon/nodejs:latest
@@ -119,7 +121,8 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | admin@lemon.vin | Let's Encrypt 邮箱；可覆盖默认值，与上面证书路径二选一 |
 | PLATFORM_PROXY_MODE | 否 | false | 是否启用平台边缘代理模式；启用后复用 `ARGO_PORT`，不启动 cloudflared、Nginx 或 Certbot |
 | PLATFORM_PUBLIC_PORT | 平台代理模式可选 | 443 | 平台外部 HTTPS 端口，仅用于生成节点链接，容器入口仍使用 `ARGO_PORT` |
-| CF_API_TOKEN | 否 | - | 直连模式 Cloudflare DNS 自动解析 Token，需 Zone Read + DNS Write |
+| CF_DNS_ENABLED | 否 | false | 是否启用直连模式 Cloudflare DNS 自动解析；默认不调用 Cloudflare DNS API |
+| CF_API_TOKEN | 否 | - | 启用 `CF_DNS_ENABLED=true` 后使用的 Cloudflare DNS API Token，需 Zone Read + DNS Write |
 | CF_DNS_ZONE_ID | 否 | 自动推断 | Cloudflare Zone ID |
 | CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称，复杂域名后缀时填写 |
 | CF_DNS_RECORD_NAME | 否 | ARGO_DOMAIN | 自动维护的 A 记录名称 |

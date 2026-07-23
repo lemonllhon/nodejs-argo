@@ -35,6 +35,7 @@ const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 1
 const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
 const DIRECT_KEY_FILE = process.env.DIRECT_KEY_FILE || "";
 const DIRECT_LETSENCRYPT_EMAIL = process.env.DIRECT_LETSENCRYPT_EMAIL || "admin@lemon.vin";
+const CF_DNS_ENABLED = parseBoolean(process.env.CF_DNS_ENABLED, false);
 const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
 const CF_DNS_ZONE_ID = process.env.CF_DNS_ZONE_ID || "";
 const CF_DNS_ZONE_NAME = process.env.CF_DNS_ZONE_NAME || "";
@@ -1019,8 +1020,8 @@ async function resolvePublicIpv4() {
 }
 
 async function syncCloudflareDnsRecord() {
-  if (!DIRECT_MODE || !CF_API_TOKEN) {
-    if (DIRECT_MODE) {
+  if (!DIRECT_MODE || !CF_DNS_ENABLED || !CF_API_TOKEN) {
+    if (DIRECT_MODE && CF_DNS_ENABLED && !CF_API_TOKEN) {
       console.log("未配置 CF_API_TOKEN，跳过 Cloudflare DNS 自动解析；请确认 ARGO_DOMAIN 已指向本机公网 IP");
     }
     return;
@@ -1102,7 +1103,7 @@ async function syncCloudflareDnsRecord() {
 }
 
 function startCloudflareDnsSyncLoop() {
-  if (cloudflareDnsSyncTimer || !DIRECT_MODE || !CF_API_TOKEN) {
+  if (cloudflareDnsSyncTimer || !DIRECT_MODE || !CF_DNS_ENABLED || !CF_API_TOKEN) {
     return;
   }
 
