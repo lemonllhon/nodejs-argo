@@ -24,8 +24,12 @@ const PLATFORM_PUBLIC_DOMAIN = process.env.PLATFORM_PUBLIC_DOMAIN
   || "";
 const PORT = process.env.SERVER_PORT || (PLATFORM_PROXY_MODE ? 3000 : process.env.PORT || 3000); // 容器内部网页端口
 const XRAY_LOG_LEVEL = process.env.XRAY_LOG_LEVEL || "warning";
+const XRAY_ACCESS_LOG_ENABLED = parseBoolean(process.env.XRAY_ACCESS_LOG_ENABLED, false);
+const XRAY_SNIFFING_ENABLED = parseBoolean(process.env.XRAY_SNIFFING_ENABLED, false);
 const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
+const CLOUDFLARED_PROTOCOL = process.env.CLOUDFLARED_PROTOCOL || "http2";
 const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
+const DIRECT_NGINX_ACCESS_LOG_ENABLED = parseBoolean(process.env.DIRECT_NGINX_ACCESS_LOG_ENABLED, false);
 const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
 const NEZHA_SERVER = process.env.NEZHA_SERVER || ""; // 哪吒 v1 格式：nz.abc.com:8008；v0 格式：nz.abc.com
 const NEZHA_PORT = process.env.NEZHA_PORT || ""; // 使用哪吒 v1 时留空，使用 v0 时填写
@@ -637,7 +641,11 @@ function cleanupOldFiles() {
 // 生成 Xray 配置文件
 async function generateConfig() {
   const config = {
-    log: { access: xrayAccessLogPath, error: xrayErrorLogPath, loglevel: XRAY_LOG_LEVEL },
+    log: {
+      access: XRAY_ACCESS_LOG_ENABLED ? xrayAccessLogPath : "",
+      error: xrayErrorLogPath,
+      loglevel: XRAY_LOG_LEVEL
+    },
     inbounds: [
       {
         port: ARGO_PORT,
@@ -670,7 +678,9 @@ async function generateConfig() {
         protocol: "vless",
         settings: { clients: [{ id: UUID, level: 0 }], decryption: "none" },
         streamSettings: { network: "ws", security: "none", wsSettings: { path: "/vless-argo" } },
-        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+        sniffing: XRAY_SNIFFING_ENABLED
+          ? { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+          : { enabled: false }
       },
       {
         port: 3003,
@@ -678,7 +688,9 @@ async function generateConfig() {
         protocol: "vmess",
         settings: { clients: [{ id: UUID, alterId: 0 }] },
         streamSettings: { network: "ws", wsSettings: { path: "/vmess-argo" } },
-        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+        sniffing: XRAY_SNIFFING_ENABLED
+          ? { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+          : { enabled: false }
       },
       {
         port: 3004,
@@ -686,7 +698,9 @@ async function generateConfig() {
         protocol: "trojan",
         settings: { clients: [{ password: UUID }] },
         streamSettings: { network: "ws", security: "none", wsSettings: { path: "/trojan-argo" } },
-        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+        sniffing: XRAY_SNIFFING_ENABLED
+          ? { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false }
+          : { enabled: false }
       }
     ],
     dns: { servers: ["https+local://8.8.8.8/dns-query"] },
@@ -830,27 +844,35 @@ function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly =
     "proxy_set_header X-Real-IP $remote_addr;",
     "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
     "proxy_set_header X-Forwarded-Proto $scheme;",
+    "proxy_connect_timeout 10s;",
     "proxy_read_timeout 86400s;",
     "proxy_send_timeout 86400s;",
-    "proxy_buffering off;"
+    "proxy_buffering off;",
+    "proxy_request_buffering off;",
+    "proxy_socket_keepalive on;"
   ];
 
   const lines = [
-    "worker_processes 1;",
+    "worker_processes auto;",
+    "worker_rlimit_nofile 65535;",
     `pid ${nginxConfigValue(runtimePidPath)};`,
     `error_log ${nginxConfigValue(errorLogPath)} ${NGINX_LOG_LEVEL};`,
     "events {",
-    "  worker_connections 1024;",
+    "  worker_connections 4096;",
     "}",
     "http {",
     "  include /etc/nginx/mime.types;",
     "  default_type application/octet-stream;",
     "  sendfile on;",
+    "  tcp_nodelay on;",
+    "  keepalive_timeout 65s;",
     "  map $http_upgrade $connection_upgrade {",
     "    default upgrade;",
     "    '' close;",
     "  }",
-    `  access_log ${nginxConfigValue(accessLogPath)} combined;`,
+    DIRECT_NGINX_ACCESS_LOG_ENABLED
+      ? `  access_log ${nginxConfigValue(accessLogPath)} combined;`
+      : "  access_log off;",
     "",
     "  server {",
     `    listen ${DIRECT_HTTP_PORT};`,
@@ -1154,16 +1176,21 @@ async function startDirectGateway() {
 }
 
 // 根据认证方式生成 cloudflared 启动参数
+function getCloudflaredProtocol() {
+  const protocol = String(CLOUDFLARED_PROTOCOL || "").trim().toLowerCase();
+  return ["auto", "quic", "http2"].includes(protocol) ? protocol : "http2";
+}
+
 function buildCloudflaredArgs() {
   if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run --token ${ARGO_AUTH}`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run --token ${ARGO_AUTH}`;
   }
 
   if (ARGO_AUTH.match(/TunnelSecret/)) {
     return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run`;
   }
 
-  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol http2 --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;
+  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;
 }
 
 // 启动镜像内置的哪吒、Xray、cloudflared
@@ -1292,7 +1319,7 @@ function argoType() {
     const tunnelYaml = `
   tunnel: ${ARGO_AUTH.split('"')[11]}
   credentials-file: ${tunnelJsonPath}
-  protocol: http2
+  protocol: ${getCloudflaredProtocol()}
   
   ingress:
     - hostname: ${ARGO_DOMAIN}

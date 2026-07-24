@@ -149,7 +149,17 @@ GitHub Actions 会在每日定时构建、推送代码变更或手动执行工�
 
 ### 运行日志
 
-Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`。可通过 `XRAY_LOG_LEVEL` 与 `CLOUDFLARED_LOG_LEVEL` 调整日志级别；容器启动时会清理运行目录中的历史文件。
+Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`。可通过 `XRAY_LOG_LEVEL` 与 `CLOUDFLARED_LOG_LEVEL` 调整日志级别；容器启动时会清理运行目录中的历史文件。生产环境默认关闭 Xray access log，排障时再临时打开，避免每个连接产生额外磁盘 I/O。
+
+### 性能优化建议
+
+- VLESS、VMess、Trojan 目前都通过 WebSocket 入口工作；通常优先使用 VLESS，协议开销更低，其他两个保留用于客户端兼容性。
+- WebSocket 节点默认关闭 Xray sniffing，因为本项目只需要按路径分流，不需要透明代理域名识别。若依赖域名路由或透明代理，再设置 `XRAY_SNIFFING_ENABLED=true`。
+- 直连模式已提高 Nginx worker、连接数和长连接转发参数，并关闭代理缓冲，适合持续 WebSocket 流量。
+- Tunnel 模式可用 `CLOUDFLARED_PROTOCOL=quic` 做 A/B 测试；默认仍为 `http2`，如果握手失败、丢包或吞吐下降就恢复 `http2`。协议选择受网络到 Cloudflare 边缘的路径影响，不保证 QUIC 一定更快。
+- `ed=2560` 已用于生成的 WebSocket 节点链接，不建议盲目增大；更换 XHTTP、gRPC 或 REALITY 会改变客户端链接格式，应单独做兼容性测试。
+
+这些调整主要减少容器内部的 CPU、日志 I/O 和代理缓冲开销。平台 HTTPS Proxy、Cloudflare Tunnel、跨境线路和平台限流仍可能是吞吐瓶颈，项目内参数不能绕过这些边缘限制。
 
 ## 📋 环境变量
 
@@ -168,6 +178,12 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | ARGO_AUTH | 否 | - | Argo固定隧道密钥 |
 | CFIP | 否 | www.cloudflare.com | 节点优选域名或IP |
 | CFPORT | 否 | 443 | 节点端口 |
+| XRAY_LOG_LEVEL | 否 | warning | Xray 错误日志级别 |
+| XRAY_ACCESS_LOG_ENABLED | 否 | false | 是否写入 Xray access log；生产建议关闭，排障时开启 |
+| XRAY_SNIFFING_ENABLED | 否 | false | 是否启用 WebSocket 流量嗅探；需要透明代理/域名路由时开启 |
+| CLOUDFLARED_LOG_LEVEL | 否 | info | cloudflared 日志级别 |
+| CLOUDFLARED_PROTOCOL | 否 | http2 | Tunnel 传输协议：`auto`、`http2` 或 `quic`；`quic` 建议先做 A/B 测试 |
+| DIRECT_NGINX_ACCESS_LOG_ENABLED | 否 | false | 直连模式是否写入 Nginx access log；生产建议关闭，排障时开启 |
 | DIRECT_MODE | 否 | false | 是否启用直连模式；启用后不启动 cloudflared |
 | DIRECT_PORT | 否 | 443 | 直连 HTTPS 和节点端口 |
 | DIRECT_HTTP_PORT | 否 | 80 | 直连 HTTP 端口，用于 ACME 验证和跳转 |
