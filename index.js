@@ -1,5 +1,6 @@
 const express = require("express");
 const app = express();
+const http = require("http");
 const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -31,12 +32,10 @@ const CLOUDFLARED_PROTOCOL = process.env.CLOUDFLARED_PROTOCOL || "http2";
 const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
 const DIRECT_NGINX_ACCESS_LOG_ENABLED = parseBoolean(process.env.DIRECT_NGINX_ACCESS_LOG_ENABLED, false);
 const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
-const NEZHA_SERVER = process.env.NEZHA_SERVER || ""; // 哪吒 v1 格式：nz.abc.com:8008；v0 格式：nz.abc.com
-const NEZHA_PORT = process.env.NEZHA_PORT || ""; // 使用哪吒 v1 时留空，使用 v0 时填写
-const NEZHA_KEY = process.env.NEZHA_KEY || ""; // 哪吒 v1 的 NZ_CLIENT_SECRET 或 v0 的 agent 密钥
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || (PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_DOMAIN : ""); // 平台模式可由平台域名环境变量自动提供
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
+const ARGO_GATEWAY_HOST = process.env.ARGO_GATEWAY_HOST || "127.0.0.1";
 const DIRECT_MODE = parseBoolean(process.env.DIRECT_MODE, false);
 const PLATFORM_PUBLIC_PORT = Number.parseInt(process.env.PLATFORM_PUBLIC_PORT || "443", 10);
 const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
@@ -56,22 +55,39 @@ const CF_DNS_REPLACE_CNAME = parseBoolean(process.env.CF_DNS_REPLACE_CNAME, true
 const CFIP = process.env.CFIP || ((DIRECT_MODE || PLATFORM_PROXY_MODE) ? ARGO_DOMAIN : "www.cloudflare.com"); // 节点优选域名或优选 IP
 const CFPORT = process.env.CFPORT || (DIRECT_MODE ? DIRECT_PORT : PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_PORT : 443); // 节点端口
 const NAME = process.env.NAME || ""; // 节点名称前缀
+const NODE_TIMEZONE = process.env.NODE_TIMEZONE || (() => {
+  try {
+    return new Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+})();
 const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
 const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
-const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "Zmd2cmZnZ3JoZnJlZ3RyaHRqZ2RmZXJ3Z3JldGh1eWtpaw==";
+const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "";
 const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "basic";
 const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "";
 const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
 const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
+const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
+  process.env.TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
+  false
+);
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
 const XRAY_BIN = process.env.XRAY_BIN || path.join(BIN_PATH, "xray");
 const CLOUDFLARED_BIN = process.env.CLOUDFLARED_BIN || path.join(BIN_PATH, "cloudflared");
-const NEZHA_AGENT_BIN = process.env.NEZHA_AGENT_BIN || path.join(BIN_PATH, "nezha-agent");
-const NEZHA_AGENT_LEGACY_BIN = process.env.NEZHA_AGENT_LEGACY_BIN || path.join(BIN_PATH, "nezha-agent-legacy");
+
+const ARGO_WS_TARGETS = Object.freeze({
+  "/vless-argo": 3002,
+  "/vmess-argo": 3003,
+  "/trojan-argo": 3004
+});
+let argoGatewayServer = null;
+let appServer = null;
 
 if (!fs.existsSync(FILE_PATH)) {
   fs.mkdirSync(FILE_PATH);
@@ -81,14 +97,10 @@ if (!fs.existsSync(FILE_PATH)) {
 }
 
 // 全局路径常量
-const npmPath = NEZHA_AGENT_LEGACY_BIN;
-const phpPath = NEZHA_AGENT_BIN;
 const webPath = XRAY_BIN;
 const botPath = CLOUDFLARED_BIN;
-const npmName = path.basename(npmPath, path.extname(npmPath));
 const webName = path.basename(webPath, path.extname(webPath));
 const botName = path.basename(botPath, path.extname(botPath));
-const phpName = path.basename(phpPath, path.extname(phpPath));
 const subPath = path.join(FILE_PATH, "sub.txt");
 const listPath = path.join(FILE_PATH, "list.txt");
 const bootLogPath = path.join(FILE_PATH, "boot.log");
@@ -101,7 +113,6 @@ const directNginxAccessLogPath = path.join(FILE_PATH, "nginx-access.log");
 const directNginxErrorLogPath = path.join(FILE_PATH, "nginx-error.log");
 const directNginxPidPath = path.join(FILE_PATH, "nginx.pid");
 const directAcmePath = path.join(FILE_PATH, "acme");
-const nezhaConfigPath = path.join(FILE_PATH, "config.yaml");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
 const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
@@ -419,6 +430,7 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
     countryCode: context.meta?.countryCode || null,
     countryName: context.meta?.countryName || null,
     ispName: context.meta?.ispName || null,
+    timezone: context.meta?.timezone || context.ipRisk?.location?.timezone || NODE_TIMEZONE || null,
     bootId: bootInstanceId,
     metadata: {
       cfip: CFIP,
@@ -453,7 +465,10 @@ async function syncNodeRegistrationToTeamNode(context) {
 
 async function syncNodeHeartbeatToTeamNode(context) {
   if (!isTeamNodeSyncConfigured() || !context) return null;
-  const payload = buildTeamNodePayload(context, { includeContent: false, runtimeStatus: "running" });
+  const payload = buildTeamNodePayload(context, {
+    includeContent: TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
+    runtimeStatus: "running"
+  });
   if (!payload) return null;
 
   try {
@@ -647,24 +662,6 @@ async function generateConfig() {
       loglevel: XRAY_LOG_LEVEL
     },
     inbounds: [
-      {
-        port: ARGO_PORT,
-        listen: DIRECT_MODE ? "127.0.0.1" : undefined,
-        protocol: "vless",
-        settings: {
-          clients: [{ id: UUID, flow: "xtls-rprx-vision" }],
-          decryption: "none",
-          fallbacks: [
-            { path: "/vless-argo", dest: 3002 },
-            { path: "/vmess-argo", dest: 3003 },
-            { path: "/trojan-argo", dest: 3004 },
-            // 未匹配代理 WebSocket 路径的普通 HTTP 请求（例如根路径 /）
-            // 最后回落到 Express Web 服务，避免固定隧道指向 ARGO_PORT 时返回 502。
-            { dest: Number(PORT) }
-          ]
-        },
-        streamSettings: { network: "tcp" }
-      },
       {
         port: 3001,
         listen: "127.0.0.1",
@@ -1175,6 +1172,123 @@ async function startDirectGateway() {
   startDirectCertificateRenewal();
 }
 
+function writeArgoGatewayResponse(socket, statusCode, message) {
+  if (!socket || socket.destroyed) return;
+  const body = `${message}\n`;
+  socket.end(
+    `HTTP/1.1 ${statusCode} ${message}\r\n` +
+    "Connection: close\r\n" +
+    "Content-Type: text/plain; charset=utf-8\r\n" +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n` +
+    body
+  );
+}
+
+function proxyArgoWebSocket(req, socket, head) {
+  let pathname = "/";
+  try {
+    pathname = new URL(req.url || "/", "http://127.0.0.1").pathname.replace(/\/$/, "") || "/";
+  } catch {
+    writeArgoGatewayResponse(socket, 400, "Bad Request");
+    return;
+  }
+
+  const targetPort = ARGO_WS_TARGETS[pathname];
+  if (!targetPort) {
+    writeArgoGatewayResponse(socket, 404, "WebSocket path not found");
+    return;
+  }
+
+  const upstream = net.createConnection({ host: "127.0.0.1", port: targetPort });
+  let connected = false;
+  let closed = false;
+
+  const closeBoth = () => {
+    if (closed) return;
+    closed = true;
+    if (!socket.destroyed) socket.destroy();
+    if (!upstream.destroyed) upstream.destroy();
+  };
+
+  upstream.setTimeout(10000, () => {
+    if (!connected) writeArgoGatewayResponse(socket, 502, "Xray upstream timeout");
+    closeBoth();
+  });
+
+  upstream.once("connect", () => {
+    connected = true;
+    const requestLines = [
+      `${req.method || "GET"} ${req.url || pathname} HTTP/${req.httpVersion || "1.1"}`
+    ];
+    Object.entries(req.headers || {}).forEach(([name, value]) => {
+      if (Array.isArray(value)) {
+        value.forEach((item) => requestLines.push(`${name}: ${item}`));
+      } else if (value !== undefined) {
+        requestLines.push(`${name}: ${value}`);
+      }
+    });
+    requestLines.push("", "");
+    upstream.write(requestLines.join("\r\n"));
+    if (head && head.length > 0) upstream.write(head);
+    socket.pipe(upstream);
+    upstream.pipe(socket);
+  });
+
+  upstream.on("error", (error) => {
+    if (!connected) {
+      console.error(`ARGO WebSocket 上游连接失败（${pathname} -> ${targetPort}）：${error.message}`);
+      writeArgoGatewayResponse(socket, 502, "Xray upstream unavailable");
+    }
+    closeBoth();
+  });
+  upstream.on("close", () => {
+    if (!socket.destroyed) socket.end();
+  });
+  socket.on("error", () => upstream.destroy());
+  socket.on("close", () => upstream.destroy());
+}
+
+function startHttpServer() {
+  if (appServer) return appServer;
+  appServer = http.createServer(app);
+  appServer.listen(PORT, () => console.log(`HTTP 服务已运行，端口：${PORT}`));
+  return appServer;
+}
+
+function startArgoGateway() {
+  if (DIRECT_MODE || argoGatewayServer) return Promise.resolve();
+
+  const gatewayPort = Number.parseInt(String(ARGO_PORT), 10);
+  const appPort = Number.parseInt(String(PORT), 10);
+  if (!Number.isInteger(gatewayPort) || gatewayPort < 1 || gatewayPort > 65535) {
+    throw new Error(`ARGO_PORT 无效：${ARGO_PORT}`);
+  }
+
+  if (gatewayPort === appPort) {
+    const server = startHttpServer();
+    server.on("upgrade", proxyArgoWebSocket);
+    argoGatewayServer = server;
+    console.log(`ARGO 网关复用 HTTP 端口：${ARGO_GATEWAY_HOST}:${gatewayPort}`);
+    return Promise.resolve();
+  }
+
+  const server = http.createServer(app);
+  server.on("upgrade", proxyArgoWebSocket);
+  argoGatewayServer = server;
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      argoGatewayServer = null;
+      reject(error);
+    };
+    server.once("error", onError);
+    server.listen(gatewayPort, ARGO_GATEWAY_HOST, () => {
+      server.off("error", onError);
+      console.log(`ARGO 网关已启动：${ARGO_GATEWAY_HOST}:${gatewayPort}（HTTP/WebSocket 分流）`);
+      resolve();
+    });
+  });
+}
+
 // 根据认证方式生成 cloudflared 启动参数
 function getCloudflaredProtocol() {
   const protocol = String(CLOUDFLARED_PROTOCOL || "").trim().toLowerCase();
@@ -1190,10 +1304,10 @@ function buildCloudflaredArgs() {
     return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run`;
   }
 
-  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;
+  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`;
 }
 
-// 启动镜像内置的哪吒、Xray、cloudflared
+// 启动 Xray、cloudflared
 async function startProcesses() {
   try {
     ensureBinaryExists(webPath, "xray");
@@ -1206,71 +1320,21 @@ async function startProcesses() {
     throw error;
   }
 
-  if (NEZHA_SERVER && NEZHA_KEY) {
-    if (!NEZHA_PORT) {
-      try {
-        ensureBinaryExists(phpPath, "nezha-agent");
-        authorizeFiles([phpPath]);
-
-        const port = NEZHA_SERVER.includes(":") ? NEZHA_SERVER.split(":").pop() : "";
-        const tlsPorts = new Set(["443", "8443", "2096", "2087", "2083", "2053"]);
-        const nezhatls = tlsPorts.has(port) ? "true" : "false";
-        const configYaml = `
-client_secret: ${NEZHA_KEY}
-debug: false
-disable_auto_update: true
-disable_command_execute: false
-disable_force_update: true
-disable_nat: false
-disable_send_query: false
-gpu: false
-insecure_tls: true
-ip_report_period: 1800
-report_delay: 4
-server: ${NEZHA_SERVER}
-skip_connection_count: true
-skip_procs_count: true
-temperature: false
-tls: ${nezhatls}
-use_gitee_to_upgrade: false
-use_ipv6_country_code: false
-uuid: ${UUID}`;
-
-        fs.writeFileSync(nezhaConfigPath, configYaml);
-        await exec(`nohup "${phpPath}" -c "${nezhaConfigPath}" >/dev/null 2>&1 &`);
-        console.log(`${phpName} 已启动`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`哪吒 v1 启动失败：${error}`);
-      }
-    } else {
-      try {
-        ensureBinaryExists(npmPath, "nezha-agent-legacy");
-        authorizeFiles([npmPath]);
-
-        let NEZHA_TLS = "";
-        const tlsPorts = ["443", "8443", "2096", "2087", "2083", "2053"];
-        if (tlsPorts.includes(NEZHA_PORT)) {
-          NEZHA_TLS = "--tls";
-        }
-
-        await exec(`nohup "${npmPath}" -s ${NEZHA_SERVER}:${NEZHA_PORT} -p ${NEZHA_KEY} ${NEZHA_TLS} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >/dev/null 2>&1 &`);
-        console.log(`${npmName} 已启动`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`哪吒 v0 启动失败：${error}`);
-      }
-    }
-  } else {
-    console.log("未配置哪吒参数，跳过启动");
-  }
-
   try {
     await exec(`nohup "${webPath}" -c "${configPath}" >/dev/null 2>&1 &`);
     console.log(`${webName} 已启动`);
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch (error) {
     console.error(`Xray 启动失败：${error}`);
+  }
+
+  if (!DIRECT_MODE) {
+    try {
+      await startArgoGateway();
+    } catch (error) {
+      console.error(`ARGO 网关启动失败：${error.message}`);
+      throw error;
+    }
   }
 
   if (DIRECT_MODE) {
@@ -1323,7 +1387,7 @@ function argoType() {
   
   ingress:
     - hostname: ${ARGO_DOMAIN}
-      service: http://localhost:${ARGO_PORT}
+      service: http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}
       originRequest:
         noTLSVerify: true
     - service: http_status:404
@@ -1417,6 +1481,7 @@ async function getMetaInfo() {
         countryCode: String(response1.data.country_code || "").trim() || "Unknown",
         countryName: String(response1.data.country || "").trim() || null,
         ispName: String(response1.data.isp || "").trim() || "Unknown",
+        timezone: String(response1.data.timezone || "").trim() || null,
         display: `${response1.data.country_code}-${response1.data.isp}`.replace(/\s+/g, "_")
       };
     }
@@ -1432,6 +1497,7 @@ async function getMetaInfo() {
           countryCode: String(response2.data.countryCode || "").trim() || "Unknown",
           countryName: String(response2.data.country || "").trim() || null,
           ispName: String(response2.data.org || "").trim() || "Unknown",
+          timezone: String(response2.data.timezone || "").trim() || null,
           display: `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, "_")
         };
       }
@@ -1440,6 +1506,7 @@ async function getMetaInfo() {
         countryCode: "Unknown",
         countryName: null,
         ispName: "Unknown",
+        timezone: null,
         display: "Unknown"
       };
     }
@@ -1449,6 +1516,7 @@ async function getMetaInfo() {
     countryCode: "Unknown",
     countryName: null,
     ispName: "Unknown",
+    timezone: null,
     display: "Unknown"
   };
 }
@@ -1483,13 +1551,13 @@ async function generateLinks(argoDomain) {
         fp: "firefox"
       };
 
-      const subTxt = `
-vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
-
-vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}
-
-trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
-      `;
+      const protocolNodes = [
+        `vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}`,
+        `vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}`,
+        `trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}`
+      ];
+      const subTxt = `\n${protocolNodes.join("\n\n")}\n`;
+      console.log("已生成 3 种协议节点：VLESS、VMess、Trojan");
 
       const contentBase64 = Buffer.from(subTxt).toString("base64");
       console.log(contentBase64);
@@ -1619,6 +1687,8 @@ async function AddVisitTask() {
 // 主启动流程
 async function startserver() {
   try {
+    console.log(`启动配置：ARGO_DOMAIN=${ARGO_DOMAIN || "(empty)"}，ARGO_PORT=${ARGO_PORT}，SERVER_PORT=${PORT}`);
+    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，密钥${TEAMNODE_SYNC_SECRET ? "已配置" : "未配置"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();
@@ -1691,5 +1761,5 @@ app.get("/", async function(req, res) {
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`HTTP 服务已运行，端口：${PORT}`));
+  startHttpServer();
 }

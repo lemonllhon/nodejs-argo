@@ -3,7 +3,7 @@
     <img src="https://cdn.nodeimage.com/i/NXz3ah3zTwikq3AdQOU0dYw3uyaBiGVj.webp" width="40" height="40" style="vertical-align: middle;"/> 
     nodejs-argo隧道代理
   </h2>
-  nodejs-argo是一个强大的Argo隧道部署工具，专为PaaS平台和游戏玩具平台设计。它支持多种代理协议（VLESS、VMess、Trojan等），并集成了哪吒探针功能。
+  nodejs-argo是一个强大的Argo隧道部署工具，专为PaaS平台和游戏玩具平台设计。它支持多种代理协议（VLESS、VMess、Trojan等）。
 
 ---
 
@@ -19,10 +19,9 @@ Telegram交流反馈群组：https://t.me/eooceu
 
 ## 说明 （部署前请仔细阅读）
 
-* 本项目是针对node环境的paas平台和游戏玩具而生，采用Argo隧道部署节点，集成哪吒探针v0或v1可选。
+* 本项目是针对node环境的paas平台和游戏玩具而生，采用Argo隧道部署节点。
 * node玩具平台只需上传index.js和package.json即可，paas平台需要docker部署的才上传Dockerfile。
 * 不填写ARGO_DOMAIN和ARGO_AUTH两个变量即启用临时隧道，反之则使用固定隧道。
-* 哪吒v0/v1可选,当哪吒端口为{443,8443,2096,2087,2083,2053}其中之一时，自动开启tls。
 
 ### 直连模式（绕过 Cloudflare Tunnel）
 
@@ -171,9 +170,6 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | PORT | 否 | 3000 | HTTP服务监听端口 |
 | ARGO_PORT | 否 | 8001 | Argo隧道端口 |
 | UUID | 否 | 89c13786-25aa-4520-b2e7-12cd60fb5202 | 用户UUID |
-| NEZHA_SERVER | 否 | - | 哪吒面板域名 |
-| NEZHA_PORT | 否 | - | 哪吒端口 |
-| NEZHA_KEY | 否 | - | 哪吒密钥 |
 | ARGO_DOMAIN | 否 | - | Argo固定隧道域名 |
 | ARGO_AUTH | 否 | - | Argo固定隧道密钥 |
 | CFIP | 否 | www.cloudflare.com | 节点优选域名或IP |
@@ -214,6 +210,7 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | TEAMNODE_SYNC_LABEL_PREFIX | 否 | 空 | TeamNode 节点标签前缀，默认直接使用国家名作为节点名称 |
 | TEAMNODE_SYNC_TIMEOUT_MS | 否 | 10000 | TeamNode 同步请求超时 |
 | TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS | 否 | 300000 | TeamNode 心跳间隔（毫秒） |
+| TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT | 否 | false | 是否在每次心跳中携带最新 `contentBase64`；无 Docker 安装器默认开启 |
 
 ## 🌐 订阅地址
 
@@ -292,8 +289,6 @@ export UPLOAD_URL="https://your-merge-sub-domain.com"
 export PROJECT_URL="https://your-project-domain.com"
 export PORT=3000
 export UUID="your-uuid-here"
-export NEZHA_SERVER="nz.your-domain.com:8008"
-export NEZHA_KEY="your-nezha-key"
 ```
 
 ## 📦 作为npm模块使用

@@ -29,6 +29,7 @@
 | `TEAMNODE_SYNC_SECRET` | 否 | - | TeamNode 内部同步签名密钥；必须单独配置，不复用其他同步通道密钥 |
 | `TEAMNODE_SYNC_TIMEOUT_MS` | 否 | `10000` | 单次请求超时 |
 | `TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS` | 否 | `300000` | 心跳间隔，默认 5 分钟 |
+| `TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT` | 否 | `false` | 是否在每次心跳中携带最新 `contentBase64`；无 Docker 安装器默认开启 |
 | `TEAMNODE_SYNC_GROUP_KEY` | 否 | `basic` | TeamNode 节点分组 Key |
 | `TEAMNODE_SYNC_PROVIDER` | 否 | 自动生成 | TeamNode 供应商标识；默认按国家/地区缩写自动生成，如 `us`、`sin` |
 | `TEAMNODE_SYNC_LABEL_PREFIX` | 否 | 空 | TeamNode 节点标签前缀；默认直接使用国家名作为节点名称 |
@@ -63,6 +64,7 @@
 - `ispName`
 - `bootId`
 - `metadata`
+- `contentBase64`（仅当 `TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT=true` 时）
 
 主动下线时会上报：
 
@@ -122,3 +124,4 @@ TEAMNODE_SYNC_SECRET=你的签名密钥
 - 定时心跳
 - 主动下线通知
 - 启动后自动接入
+- 可选的心跳内容同步
