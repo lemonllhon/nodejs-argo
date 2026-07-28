@@ -148,7 +148,20 @@ GitHub Actions 会在每日定时构建、推送代码变更或手动执行工�
 
 ### 运行日志
 
-Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`。可通过 `XRAY_LOG_LEVEL` 与 `CLOUDFLARED_LOG_LEVEL` 调整日志级别；容器启动时会清理运行目录中的历史文件。生产环境默认关闭 Xray access log，排障时再临时打开，避免每个连接产生额外磁盘 I/O。
+Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`；由 Node.js 进程管理器捕获的标准输出和启动错误分别写入 `xray-process.log`、`cloudflared-process.log`，直连模式下 Nginx 的进程日志写入 `nginx-process.log`。临时 Tunnel 的域名发现日志保留在 `boot.log`，不会在运行期间被定时删除。生产环境默认关闭 Xray access log，排障时再临时打开，避免每个连接产生额外磁盘 I/O。
+
+### 进程托管与后台运行
+
+当前 `index.js` 会直接托管 Xray 和 cloudflared 子进程：启动后检查三种协议端口 `3002/3003/3004`，子进程异常退出时自动重启，并在 Node.js 收到 `SIGTERM`/`SIGINT` 时先停止子进程、关闭网关再退出。相同 `FILE_PATH` 不能同时启动两个 Node.js 实例，运行锁保存在 `nodejs-argo.pid`。
+
+因此不需要再使用 `start_lemon.py`、`nohup` 或 `pkill` 来包裹 Xray/cloudflared；这些方式会让子进程脱离 Node.js，容易产生孤儿进程、端口冲突和环境变量不一致。Node.js 主进程本身仍建议由 Docker `--restart unless-stopped`、systemd、PM2 或平台的进程管理功能负责开机启动。
+
+可选的运行参数：
+
+* `MANAGED_PROCESS_RESTART_DELAY_MS`：子进程退出后的重启等待时间，默认 `5000` 毫秒；
+* `PROCESS_START_TIMEOUT_MS`：启动进程和检查协议端口的超时时间，默认 `15000` 毫秒；
+* `TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS`：每次等待临时 Tunnel 域名的时间，默认 `90000` 毫秒；
+* `TEMP_TUNNEL_MAX_ATTEMPTS`：临时 Tunnel 域名发现失败后的最大重启次数，默认 `3`。
 
 ### 性能优化建议
 
@@ -201,6 +214,10 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | NAME | 否 | Vls | 节点名称前缀 |
 | FILE_PATH | 否 | ./tmp | 运行目录 |
 | SUB_PATH | 否 | sub | 订阅路径 |
+| MANAGED_PROCESS_RESTART_DELAY_MS | 否 | 5000 | Xray/cloudflared 异常退出后的自动重启等待时间（毫秒） |
+| PROCESS_START_TIMEOUT_MS | 否 | 15000 | 进程启动和协议端口检查超时时间（毫秒） |
+| TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS | 否 | 90000 | 每次等待临时 Tunnel 域名的时间（毫秒） |
+| TEMP_TUNNEL_MAX_ATTEMPTS | 否 | 3 | 临时 Tunnel 域名发现失败后的最大尝试次数 |
 | TEAMNODE_SYNC_ENABLED | 否 | 自动推断 | 是否启用 TeamNode 同步；默认只要配置了 `TEAMNODE_SYNC_SECRET` 就会自动启用 |
 | TEAMNODE_SYNC_BASE_URL | 否 | `https://teamnode.lemon.vin` | TeamNode 地址 |
 | TEAMNODE_SYNC_KEY_ID | 否 | `nodejs-argo-prod` | TeamNode 内部同步 Key ID |

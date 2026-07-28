@@ -7,7 +7,8 @@ const fs = require("fs");
 const path = require("path");
 const net = require("net");
 const { promisify } = require("util");
-const exec = promisify(require("child_process").exec);
+const { exec: childExec, spawn } = require("child_process");
+const exec = promisify(childExec);
 const UPLOAD_URL = process.env.UPLOAD_URL || ""; // 节点或订阅自动上传地址，例如：https://merge.xxx.com
 const PROJECT_URL = process.env.PROJECT_URL || ""; // 项目分配的访问地址，例如：https://google.com
 const AUTO_ACCESS = process.env.AUTO_ACCESS || false; // 是否开启自动保活，需要同时配置 PROJECT_URL
@@ -75,6 +76,22 @@ const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
   false
 );
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
+const MANAGED_PROCESS_RESTART_DELAY_MS = Number.parseInt(
+  process.env.MANAGED_PROCESS_RESTART_DELAY_MS || "5000",
+  10
+);
+const PROCESS_START_TIMEOUT_MS = Number.parseInt(
+  process.env.PROCESS_START_TIMEOUT_MS || "15000",
+  10
+);
+const TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS = Number.parseInt(
+  process.env.TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS || "90000",
+  10
+);
+const TEMP_TUNNEL_MAX_ATTEMPTS = Number.parseInt(
+  process.env.TEMP_TUNNEL_MAX_ATTEMPTS || "3",
+  10
+);
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -107,10 +124,14 @@ const bootLogPath = path.join(FILE_PATH, "boot.log");
 const configPath = path.join(FILE_PATH, "config.json");
 const xrayAccessLogPath = path.join(FILE_PATH, "xray-access.log");
 const xrayErrorLogPath = path.join(FILE_PATH, "xray-error.log");
+const xrayProcessLogPath = path.join(FILE_PATH, "xray-process.log");
 const cloudflaredLogPath = path.join(FILE_PATH, "cloudflared.log");
+const cloudflaredProcessLogPath = path.join(FILE_PATH, "cloudflared-process.log");
+const runtimeLockPath = path.join(FILE_PATH, "nodejs-argo.pid");
 const directNginxConfigPath = path.join(FILE_PATH, "nginx-direct.conf");
 const directNginxAccessLogPath = path.join(FILE_PATH, "nginx-access.log");
 const directNginxErrorLogPath = path.join(FILE_PATH, "nginx-error.log");
+const nginxProcessLogPath = path.join(FILE_PATH, "nginx-process.log");
 const directNginxPidPath = path.join(FILE_PATH, "nginx.pid");
 const directAcmePath = path.join(FILE_PATH, "acme");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
@@ -125,6 +146,11 @@ let teamnodeShutdownPromise = null;
 let directCertificateRenewalTimer = null;
 let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
+let runtimeLockAcquired = false;
+const managedChildren = new Map();
+const managedProcessConfigs = new Map();
+const managedRestartTimers = new Map();
+const managedStopRequested = new Set();
 let bootInstanceId = createRandomToken();
 const PROVIDER_CODE_OVERRIDES = {
   SG: "sin"
@@ -632,7 +658,7 @@ function deleteNodes() {
 function cleanupOldFiles() {
   try {
     const preservedFiles = new Set(
-      [DIRECT_CERT_FILE, DIRECT_KEY_FILE]
+      [DIRECT_CERT_FILE, DIRECT_KEY_FILE, runtimeLockPath]
         .filter(Boolean)
         .map((filePath) => path.resolve(filePath))
     );
@@ -728,6 +754,263 @@ function authorizeFiles(filePaths) {
 
     fs.chmodSync(absoluteFilePath, newPermissions);
   });
+}
+
+function acquireRuntimeLock() {
+  if (runtimeLockAcquired) return;
+
+  if (fs.existsSync(runtimeLockPath)) {
+    const previousPid = Number.parseInt(fs.readFileSync(runtimeLockPath, "utf8").trim(), 10);
+    if (Number.isInteger(previousPid) && previousPid > 0 && previousPid !== process.pid) {
+      let previousProcessIsRunning = false;
+      try {
+        process.kill(previousPid, 0);
+        previousProcessIsRunning = true;
+      } catch (error) {
+        // ESRCH 表示 PID 已不存在；EPERM 表示进程存在但当前用户无权探测。
+        previousProcessIsRunning = error && error.code === "EPERM";
+      }
+
+      if (previousProcessIsRunning) {
+        throw new Error(`检测到相同运行目录已有 Node.js 实例运行（PID ${previousPid}）：${FILE_PATH}`);
+      }
+    }
+  }
+
+  fs.writeFileSync(runtimeLockPath, `${process.pid}\n`, { mode: 0o644 });
+  runtimeLockAcquired = true;
+}
+
+function releaseRuntimeLock() {
+  if (!runtimeLockAcquired) return;
+
+  try {
+    const lockPid = Number.parseInt(fs.readFileSync(runtimeLockPath, "utf8").trim(), 10);
+    if (lockPid === process.pid) {
+      fs.unlinkSync(runtimeLockPath);
+    }
+  } catch {
+    // 退出阶段清理失败不应覆盖原始退出原因。
+  }
+
+  runtimeLockAcquired = false;
+}
+
+function isManagedChildRunning(child) {
+  return Boolean(child && child.exitCode === null && !child.killed);
+}
+
+function clearManagedRestartTimer(name) {
+  const timer = managedRestartTimers.get(name);
+  if (timer) {
+    clearTimeout(timer);
+    managedRestartTimers.delete(name);
+  }
+}
+
+function scheduleManagedProcessRestart(name) {
+  if (processShutdownRequested || managedStopRequested.has(name) || managedRestartTimers.has(name)) {
+    return;
+  }
+
+  const config = managedProcessConfigs.get(name);
+  if (!config) return;
+
+  const delay = Number.isFinite(MANAGED_PROCESS_RESTART_DELAY_MS) && MANAGED_PROCESS_RESTART_DELAY_MS > 0
+    ? MANAGED_PROCESS_RESTART_DELAY_MS
+    : 5000;
+
+  console.warn(`[process-manager] ${name} 已退出，将在 ${delay}ms 后自动重启`);
+  const timer = setTimeout(() => {
+    managedRestartTimers.delete(name);
+    if (processShutdownRequested || managedStopRequested.has(name)) return;
+
+    try {
+      spawnManagedProcess(name, config.command, config.args, config.options);
+    } catch (error) {
+      console.error(`[process-manager] ${name} 重启失败：${error.message}`);
+      scheduleManagedProcessRestart(name);
+    }
+  }, delay);
+
+  managedRestartTimers.set(name, timer);
+}
+
+function spawnManagedProcess(name, command, args = [], options = {}) {
+  const existing = managedChildren.get(name);
+  if (existing && isManagedChildRunning(existing.child)) {
+    return existing.child;
+  }
+
+  clearManagedRestartTimer(name);
+  managedStopRequested.delete(name);
+
+  const logPath = options.logPath;
+  let logFd = null;
+  if (logPath) {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    logFd = fs.openSync(logPath, "a");
+  }
+
+  let child;
+  try {
+    child = spawn(command, args, {
+      cwd: options.cwd || process.cwd(),
+      env: { ...process.env },
+      detached: false,
+      stdio: ["ignore", logFd === null ? "ignore" : logFd, logFd === null ? "ignore" : logFd]
+    });
+  } catch (error) {
+    if (logFd !== null) fs.closeSync(logFd);
+    throw error;
+  }
+
+  const record = { name, command, args: [...args], options: { ...options }, child, logFd };
+  managedChildren.set(name, record);
+  managedProcessConfigs.set(name, { command, args: [...args], options: { ...options } });
+
+  child.once("error", (error) => {
+    console.error(`[process-manager] ${name} 错误：${error.message}`);
+  });
+
+  child.once("close", (code, signal) => {
+    const current = managedChildren.get(name);
+    if (current && current.child === child) {
+      managedChildren.delete(name);
+    }
+    if (logFd !== null) {
+      try {
+        fs.closeSync(logFd);
+      } catch {
+        // 文件描述符可能已经被系统关闭。
+      }
+    }
+
+    if (!managedStopRequested.has(name) && !processShutdownRequested) {
+      console.warn(`[process-manager] ${name} 已停止（code=${code}, signal=${signal || "none"}）`);
+      scheduleManagedProcessRestart(name);
+    }
+  });
+
+  console.log(`[process-manager] ${name} 已启动（PID ${child.pid}）`);
+  return child;
+}
+
+async function waitForManagedProcess(name, child, timeoutMs = PROCESS_START_TIMEOUT_MS) {
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const record = managedChildren.get(name);
+    if (!record || record.child !== child || child.exitCode !== null) {
+      throw new Error(`${name} 启动后立即退出，请查看 ${record && record.options.logPath ? record.options.logPath : FILE_PATH} 日志`);
+    }
+    if (isManagedChildRunning(child)) return child;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(`${name} 启动超时（${timeout}ms）`);
+}
+
+function waitForTcpPort(port, host = "127.0.0.1", timeoutMs = PROCESS_START_TIMEOUT_MS) {
+  const targetHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
+
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeout;
+    let settled = false;
+    let timer = null;
+
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+
+    const attempt = () => {
+      if (Date.now() >= deadline) {
+        finish(new Error(`端口 ${targetHost}:${port} 在 ${timeout}ms 内未监听`));
+        return;
+      }
+
+      const socket = net.createConnection({ host: targetHost, port });
+      let connected = false;
+      socket.setTimeout(1000);
+      socket.once("connect", () => {
+        connected = true;
+        socket.destroy();
+        finish();
+      });
+      socket.once("error", () => {
+        socket.destroy();
+        if (!settled) timer = setTimeout(attempt, 250);
+      });
+      socket.once("timeout", () => socket.destroy());
+      socket.once("close", () => {
+        if (!connected && !settled && !timer) timer = setTimeout(attempt, 250);
+      });
+    };
+
+    attempt();
+  });
+}
+
+async function stopManagedProcess(name, timeoutMs = 5000) {
+  managedStopRequested.add(name);
+  clearManagedRestartTimer(name);
+
+  const record = managedChildren.get(name);
+  if (!record || !record.child) return;
+
+  const child = record.child;
+  if (!isManagedChildRunning(child)) return;
+
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
+  const closePromise = new Promise((resolve) => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+    child.once("close", finish);
+    setTimeout(finish, timeout);
+  });
+
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // 子进程可能已经退出。
+  }
+  await closePromise;
+
+  if (isManagedChildRunning(child)) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // 子进程可能已经退出。
+    }
+  }
+}
+
+async function stopManagedProcesses() {
+  await Promise.all([...managedChildren.keys()].map((name) => stopManagedProcess(name)));
+  managedProcessConfigs.clear();
+}
+
+async function closeApplicationServers() {
+  const servers = [...new Set([appServer, argoGatewayServer].filter(Boolean))];
+  await Promise.all(servers.map((server) => new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    server.close(() => resolve());
+  })));
+  appServer = null;
+  argoGatewayServer = null;
 }
 
 function shellQuote(value) {
@@ -931,6 +1214,7 @@ function writeDirectNginxConfig(options = {}) {
 }
 
 async function stopDirectNginx() {
+  await stopManagedProcess("nginx").catch(() => null);
   try {
     await exec(`${shellQuote(NGINX_BIN)} -c ${shellQuote(path.resolve(directNginxConfigPath))} -s stop`);
   } catch {
@@ -941,8 +1225,15 @@ async function stopDirectNginx() {
 async function startNginx() {
   const config = path.resolve(directNginxConfigPath);
   await exec(`${shellQuote(NGINX_BIN)} -t -c ${shellQuote(config)}`);
-  await exec(`nohup ${shellQuote(NGINX_BIN)} -c ${shellQuote(config)} >/dev/null 2>&1 &`);
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  const nginxProcess = spawnManagedProcess("nginx", NGINX_BIN, [
+    "-c",
+    config,
+    "-g",
+    "daemon off;"
+  ], {
+    logPath: nginxProcessLogPath
+  });
+  await waitForManagedProcess("nginx", nginxProcess);
 }
 
 async function ensureDirectCertificate() {
@@ -1296,15 +1587,65 @@ function getCloudflaredProtocol() {
 }
 
 function buildCloudflaredArgs() {
-  if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run --token ${ARGO_AUTH}`;
+  const auth = String(ARGO_AUTH || "").trim();
+  const baseArgs = [
+    "tunnel",
+    "--edge-ip-version",
+    "auto",
+    "--autoupdate-freq",
+    "24h"
+  ];
+
+  // Tunnel Token 不固定长度，不能用旧的 120-250 位正则限制。
+  if (auth && !auth.includes("TunnelSecret") && !auth.startsWith("{")) {
+    return [
+      ...baseArgs,
+      "--protocol",
+      getCloudflaredProtocol(),
+      "--logfile",
+      cloudflaredLogPath,
+      "--loglevel",
+      CLOUDFLARED_LOG_LEVEL,
+      "run",
+      "--token",
+      auth
+    ];
   }
 
-  if (ARGO_AUTH.match(/TunnelSecret/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run`;
+  if (auth.includes("TunnelSecret")) {
+    return [
+      ...baseArgs,
+      "--config",
+      tunnelYamlPath,
+      "--logfile",
+      cloudflaredLogPath,
+      "--loglevel",
+      CLOUDFLARED_LOG_LEVEL,
+      "run"
+    ];
   }
 
-  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`;
+  return [
+    ...baseArgs,
+    "--protocol",
+    getCloudflaredProtocol(),
+    "--logfile",
+    bootLogPath,
+    "--loglevel",
+    "info",
+    "--url",
+    `http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`
+  ];
+}
+
+function startCloudflaredProcess() {
+  const args = buildCloudflaredArgs();
+  if (args.includes(bootLogPath)) {
+    fs.rmSync(bootLogPath, { force: true });
+  }
+  return spawnManagedProcess("cloudflared", botPath, args, {
+    logPath: cloudflaredProcessLogPath
+  });
 }
 
 // 启动 Xray、cloudflared
@@ -1320,13 +1661,15 @@ async function startProcesses() {
     throw error;
   }
 
-  try {
-    await exec(`nohup "${webPath}" -c "${configPath}" >/dev/null 2>&1 &`);
-    console.log(`${webName} 已启动`);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  } catch (error) {
-    console.error(`Xray 启动失败：${error}`);
+  const xrayProcess = spawnManagedProcess("xray", webPath, ["-c", configPath], {
+    logPath: xrayProcessLogPath
+  });
+  await waitForManagedProcess("xray", xrayProcess);
+
+  for (const port of Object.values(ARGO_WS_TARGETS)) {
+    await waitForTcpPort(port, "127.0.0.1");
   }
+  console.log(`${webName} 已启动，三协议端口 ${Object.values(ARGO_WS_TARGETS).join("/")} 已监听`);
 
   if (!DIRECT_MODE) {
     try {
@@ -1350,16 +1693,14 @@ async function startProcesses() {
     console.log("平台应将 HTTPS/HTTP WebSocket 请求转发到容器的 ARGO_PORT；容器不申请、不校验证书");
   } else {
     try {
-      const args = buildCloudflaredArgs();
-      await exec(`nohup "${botPath}" ${args} >/dev/null 2>&1 &`);
-      console.log(`${botName} 已启动`);
+      startCloudflaredProcess();
       await new Promise((resolve) => setTimeout(resolve, 2000));
+      console.log(`${botName} 已启动，进程由 Node.js 托管`);
     } catch (error) {
-      console.error(`cloudflared 启动失败：${error}`);
+      console.error(`cloudflared 启动失败：${error.message}`);
+      throw error;
     }
   }
-
-  await new Promise((resolve) => setTimeout(resolve, 5000));
 }
 
 // 生成固定隧道配置文件
@@ -1416,56 +1757,43 @@ async function extractDomains() {
     return;
   }
 
-  try {
-    const fileContent = fs.readFileSync(bootLogPath, "utf-8");
-    const lines = fileContent.split("\n");
-    const argoDomains = [];
-
-    lines.forEach((line) => {
-      const domainMatch = line.match(/https?:\/\/([^ ]*trycloudflare\.com)\/?/);
-      if (domainMatch) {
-        argoDomains.push(domainMatch[1]);
-      }
-    });
-
-    if (argoDomains.length > 0) {
-      argoDomain = argoDomains[0];
-      console.log("ArgoDomain:", argoDomain);
-      await generateLinks(argoDomain);
-      return;
-    }
-
-    console.log("未找到 ArgoDomain，重新启动 cloudflared 获取域名");
-    fs.unlinkSync(bootLogPath);
-
-    async function killBotProcess() {
-      try {
-        if (process.platform === "win32") {
-          await exec(`taskkill /f /im ${botName}.exe > nul 2>&1`);
-        } else {
-          await exec(`pkill -f "[${botName.charAt(0)}]${botName.substring(1)}" > /dev/null 2>&1`);
-        }
-      } catch {
-        return null;
-      }
-      return null;
-    }
-
-    await killBotProcess();
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-
+  const readTemporaryArgoDomain = () => {
     try {
-      const args = buildCloudflaredArgs();
-      await exec(`nohup "${botPath}" ${args} >/dev/null 2>&1 &`);
-      console.log(`${botName} 已重新启动`);
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      await extractDomains();
-    } catch (error) {
-      console.error(`重新启动 cloudflared 失败：${error}`);
+      const fileContent = fs.readFileSync(bootLogPath, "utf-8");
+      const domainMatch = fileContent.match(/https?:\/\/([^\s/]*trycloudflare\.com)\/?/);
+      return domainMatch ? domainMatch[1] : "";
+    } catch {
+      return "";
     }
-  } catch (error) {
-    console.error("读取 boot.log 失败:", error);
+  };
+
+  const maxAttempts = Number.isInteger(TEMP_TUNNEL_MAX_ATTEMPTS) && TEMP_TUNNEL_MAX_ATTEMPTS > 0
+    ? TEMP_TUNNEL_MAX_ATTEMPTS
+    : 3;
+  const discoveryTimeout = Number.isInteger(TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS) && TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS > 0
+    ? TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS
+    : 90000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const deadline = Date.now() + discoveryTimeout;
+    while (Date.now() < deadline) {
+      argoDomain = readTemporaryArgoDomain();
+      if (argoDomain) {
+        console.log("ArgoDomain:", argoDomain);
+        await generateLinks(argoDomain);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    if (attempt >= maxAttempts) break;
+    console.warn(`未找到 ArgoDomain，将由进程管理器重启 cloudflared（第 ${attempt + 1}/${maxAttempts} 次）`);
+    await stopManagedProcess("cloudflared");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    startCloudflaredProcess();
   }
+
+  throw new Error(`临时 Cloudflare Tunnel 在 ${maxAttempts} 次尝试后仍未返回 trycloudflare.com 域名；请查看 ${bootLogPath} 和 ${cloudflaredProcessLogPath}`);
 }
 
 // 获取当前机器的 ISP 信息，用于节点命名
@@ -1639,22 +1967,16 @@ async function uploadNodes() {
   return null;
 }
 
-// 延迟清理临时日志文件
+// 只清理上一次异常退出遗留的临时 Tunnel 日志。
+// 运行期间不能定时删除 boot.log，否则域名发现较慢时会丢失 Tunnel 地址。
 function cleanFiles() {
-  setTimeout(() => {
-    try {
-      if (fs.existsSync(bootLogPath)) {
-        fs.unlinkSync(bootLogPath);
-      }
-    } catch {
-      return null;
+  try {
+    if (!managedChildren.has("cloudflared")) {
+      fs.rmSync(bootLogPath, { force: true });
     }
-
-    console.clear();
-    console.log("应用已运行");
-    console.log("感谢使用，祝你使用愉快！");
-    return null;
-  }, 90000);
+  } catch {
+    // 日志清理失败不应阻止主程序启动。
+  }
 }
 cleanFiles();
 
@@ -1687,6 +2009,7 @@ async function AddVisitTask() {
 // 主启动流程
 async function startserver() {
   try {
+    acquireRuntimeLock();
     console.log(`启动配置：ARGO_DOMAIN=${ARGO_DOMAIN || "(empty)"}，ARGO_PORT=${ARGO_PORT}，SERVER_PORT=${PORT}`);
     console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，密钥${TEAMNODE_SYNC_SECRET ? "已配置" : "未配置"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
     validateDirectMode();
@@ -1703,6 +2026,15 @@ async function startserver() {
     await AddVisitTask();
   } catch (error) {
     console.error("startserver 执行失败:", error);
+    await Promise.all([
+      shutdownTeamNodeSync("startup_failed"),
+      stopManagedProcesses(),
+      closeApplicationServers()
+    ]).catch(() => null);
+    if (cloudflareDnsSyncTimer) clearInterval(cloudflareDnsSyncTimer);
+    if (directCertificateRenewalTimer) clearInterval(directCertificateRenewalTimer);
+    releaseRuntimeLock();
+    throw error;
   }
 }
 
@@ -1712,9 +2044,16 @@ function handleProcessShutdownSignal(signal) {
   }
 
   processShutdownRequested = true;
-  shutdownTeamNodeSync(`signal_${String(signal || "shutdown").toLowerCase()}`)
+  Promise.all([
+    shutdownTeamNodeSync(`signal_${String(signal || "shutdown").toLowerCase()}`),
+    stopManagedProcesses(),
+    closeApplicationServers()
+  ])
     .catch(() => null)
     .finally(() => {
+      if (cloudflareDnsSyncTimer) clearInterval(cloudflareDnsSyncTimer);
+      if (directCertificateRenewalTimer) clearInterval(directCertificateRenewalTimer);
+      releaseRuntimeLock();
       process.exit(0);
     });
 }
@@ -1725,6 +2064,10 @@ process.on("SIGINT", () => {
 
 process.on("SIGTERM", () => {
   handleProcessShutdownSignal("SIGTERM");
+});
+
+process.on("exit", () => {
+  releaseRuntimeLock();
 });
 
 if (require.main === module) {
