@@ -4,11 +4,25 @@ const http = require("http");
 const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const net = require("net");
 const { promisify } = require("util");
 const { exec: childExec, spawn } = require("child_process");
 const exec = promisify(childExec);
+
+function createUuidV4() {
+  if (typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  const bytes = crypto.randomBytes(16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 const UPLOAD_URL = process.env.UPLOAD_URL || ""; // 节点或订阅自动上传地址，例如：https://merge.xxx.com
 const PROJECT_URL = process.env.PROJECT_URL || ""; // 项目分配的访问地址，例如：https://google.com
 const AUTO_ACCESS = process.env.AUTO_ACCESS || false; // 是否开启自动保活，需要同时配置 PROJECT_URL
@@ -32,7 +46,7 @@ const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
 const CLOUDFLARED_PROTOCOL = process.env.CLOUDFLARED_PROTOCOL || "http2";
 const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
 const DIRECT_NGINX_ACCESS_LOG_ENABLED = parseBoolean(process.env.DIRECT_NGINX_ACCESS_LOG_ENABLED, false);
-const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
+const UUID = String(process.env.UUID || "").trim() || createUuidV4(); // 未指定时为本次进程生成 UUID v4
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || (PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_DOMAIN : ""); // 平台模式可由平台域名环境变量自动提供
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
@@ -63,9 +77,9 @@ const NODE_TIMEZONE = process.env.NODE_TIMEZONE || (() => {
     return "";
   }
 })();
-const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
-const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
-const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "";
+const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://install.lemon.vin";
+const TEAMNODE_SYNC_ENROLL_PASSWORD = process.env.TEAMNODE_SYNC_ENROLL_PASSWORD || "";
+const TEAMNODE_SYNC_RELAY_TOKEN = process.env.TEAMNODE_SYNC_RELAY_TOKEN || "";
 const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "basic";
 const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "";
 const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
@@ -73,7 +87,7 @@ const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEO
 const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
   process.env.TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
-  false
+  true
 );
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
 const MANAGED_PROCESS_RESTART_DELAY_MS = Number.parseInt(
@@ -167,25 +181,11 @@ function parseBoolean(value, fallback = false) {
 
 const TEAMNODE_SYNC_ENABLED = parseBoolean(
   process.env.TEAMNODE_SYNC_ENABLED,
-  Boolean(TEAMNODE_SYNC_SECRET)
+  Boolean(TEAMNODE_SYNC_ENROLL_PASSWORD || TEAMNODE_SYNC_RELAY_TOKEN)
 );
 
 function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
-}
-
-function normalizeRequestPath(value) {
-  const raw = String(value || "/").trim() || "/";
-  const withoutQuery = raw.split("?")[0] || "/";
-  const collapsed = withoutQuery.replace(/\/{2,}/g, "/");
-  if (collapsed.length > 1 && collapsed.endsWith("/")) {
-    return collapsed.slice(0, -1);
-  }
-  return collapsed || "/";
-}
-
-function sha256Hex(value = "") {
-  return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
 }
 
 function createRandomToken() {
@@ -195,46 +195,11 @@ function createRandomToken() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-function createTeamNodeSyncHeaders({ method = "GET", path: requestPath = "/", rawBody = "", eventPrefix = "nodejs_argo" }) {
-  const timestamp = Date.now().toString();
-  const nonce = createRandomToken();
-  const eventId = `${eventPrefix}_${createRandomToken().replace(/-/g, "")}`;
-  const normalizedMethod = String(method || "GET").trim().toUpperCase();
-  const normalizedPath = normalizeRequestPath(requestPath);
-  const signaturePayload = [
-    normalizedMethod,
-    normalizedPath,
-    sha256Hex(rawBody),
-    timestamp,
-    nonce,
-    eventId
-  ].join("\n");
-  const signature = crypto
-    .createHmac("sha256", String(TEAMNODE_SYNC_SECRET || ""))
-    .update(signaturePayload, "utf8")
-    .digest("hex");
-
-  return {
-    eventId,
-    nonce,
-    timestamp,
-    signature,
-    headers: {
-      "x-sync-key-id": TEAMNODE_SYNC_KEY_ID,
-      "x-sync-timestamp": timestamp,
-      "x-sync-nonce": nonce,
-      "x-event-id": eventId,
-      "x-sync-signature": signature
-    }
-  };
-}
-
 function isTeamNodeSyncConfigured() {
   return Boolean(
     TEAMNODE_SYNC_ENABLED
     && normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL)
-    && TEAMNODE_SYNC_KEY_ID
-    && TEAMNODE_SYNC_SECRET
+    && (TEAMNODE_SYNC_ENROLL_PASSWORD || TEAMNODE_SYNC_RELAY_TOKEN)
   );
 }
 
@@ -417,28 +382,119 @@ function buildTeamNodeLabel(nodeName, argoDomain, meta = {}) {
   return `${prefix}-${suffix}`.slice(0, 128);
 }
 
-async function postTeamNodeSync(relativePath, payload, eventPrefix) {
+let teamnodeSyncRelayToken = String(TEAMNODE_SYNC_RELAY_TOKEN || "").trim();
+
+function readRuntimeLimit(filePath) {
+  try {
+    return String(fs.readFileSync(filePath, "utf8") || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function resolveRuntimeCpuCores() {
+  const cpuMax = readRuntimeLimit("/sys/fs/cgroup/cpu.max");
+  if (cpuMax) {
+    const [quotaText, periodText] = cpuMax.split(/\s+/);
+    const quota = Number(quotaText);
+    const period = Number(periodText);
+    if (quotaText !== "max" && Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
+      return Math.max(1, Math.ceil(quota / period));
+    }
+  }
+
+  const quota = Number(readRuntimeLimit("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"));
+  const period = Number(readRuntimeLimit("/sys/fs/cgroup/cpu/cpu.cfs_period_us"));
+  if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
+    return Math.max(1, Math.ceil(quota / period));
+  }
+
+  const hostCores = os.cpus().length;
+  return Number.isFinite(hostCores) && hostCores > 0 ? hostCores : null;
+}
+
+function resolveRuntimeMemoryMb() {
+  const memoryLimit = [
+    readRuntimeLimit("/sys/fs/cgroup/memory.max"),
+    readRuntimeLimit("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+  ].find((value) => value && value !== "max");
+  const limitBytes = Number(memoryLimit);
+  const hostBytes = os.totalmem();
+  if (Number.isFinite(limitBytes) && limitBytes > 0 && limitBytes < 1024 ** 4) {
+    return Math.max(1, Math.round(limitBytes / (1024 * 1024)));
+  }
+  return Number.isFinite(hostBytes) && hostBytes > 0
+    ? Math.round(hostBytes / (1024 * 1024))
+    : null;
+}
+
+function getRuntimeInfo() {
+  return {
+    platform: String(process.platform || "").slice(0, 32),
+    arch: String(process.arch || "").slice(0, 32),
+    osType: String(os.type() || "").slice(0, 64),
+    osRelease: String(os.release() || "").slice(0, 128),
+    cpuCores: resolveRuntimeCpuCores(),
+    memoryMb: resolveRuntimeMemoryMb()
+  };
+}
+
+async function redeemTeamNodeRelayToken() {
+  if (teamnodeSyncRelayToken) return teamnodeSyncRelayToken;
+  if (!TEAMNODE_SYNC_ENROLL_PASSWORD) {
+    throw new Error("TEAMNODE_SYNC_ENROLL_PASSWORD 未配置，无法向 Worker 兑换中继令牌");
+  }
+
   const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
-  if (!baseUrl) return null;
+  if (!baseUrl) throw new Error("TEAMNODE_SYNC_BASE_URL 未配置");
 
-  const requestUrl = new URL(relativePath, `${baseUrl}/`);
-  const rawBody = JSON.stringify(payload || {});
-  const { headers } = createTeamNodeSyncHeaders({
-    method: "POST",
-    path: requestUrl.pathname,
-    rawBody,
-    eventPrefix
-  });
-
-  return axios.post(requestUrl.toString(), payload, {
-    headers: {
-      "Content-Type": "application/json",
-      ...headers
-    },
+  const requestUrl = new URL("/api/teamnode/redeem", `${baseUrl}/`);
+  const response = await axios.post(requestUrl.toString(), {
+    password: TEAMNODE_SYNC_ENROLL_PASSWORD,
+    uuid: UUID
+  }, {
+    headers: { "Content-Type": "application/json" },
     timeout: Number.isFinite(TEAMNODE_SYNC_TIMEOUT_MS) && TEAMNODE_SYNC_TIMEOUT_MS > 0
       ? TEAMNODE_SYNC_TIMEOUT_MS
       : 10000
   });
+  const relayToken = String(response?.data?.relayToken || "").trim();
+  if (!/^relay_v1_[0-9a-f]{64}$/.test(relayToken)) {
+    throw new Error("Worker 返回的中继令牌格式无效");
+  }
+
+  teamnodeSyncRelayToken = relayToken;
+  console.log("TeamNode Worker 中继令牌兑换成功（兑换密码不会写入日志）");
+  return teamnodeSyncRelayToken;
+}
+
+async function postTeamNodeSync(relativePath, payload) {
+  const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
+  if (!baseUrl) return null;
+
+  const requestUrl = new URL(relativePath, `${baseUrl}/`);
+  const timeout = Number.isFinite(TEAMNODE_SYNC_TIMEOUT_MS) && TEAMNODE_SYNC_TIMEOUT_MS > 0
+    ? TEAMNODE_SYNC_TIMEOUT_MS
+    : 10000;
+  const send = async (relayToken) => axios.post(requestUrl.toString(), payload, {
+    headers: {
+      "Content-Type": "application/json",
+      "x-teamnode-sync-relay-token": relayToken
+    },
+    timeout
+  });
+
+  const relayToken = await redeemTeamNodeRelayToken();
+  try {
+    return await send(relayToken);
+  } catch (error) {
+    // Worker 重启或轮换中继配置后，密码模式可在下一次请求中重新兑换一次。
+    if (error?.response?.status === 401 && TEAMNODE_SYNC_ENROLL_PASSWORD && !TEAMNODE_SYNC_RELAY_TOKEN) {
+      teamnodeSyncRelayToken = "";
+      return send(await redeemTeamNodeRelayToken());
+    }
+    throw error;
+  }
 }
 
 function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = "starting" } = {}) {
@@ -456,7 +512,8 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
     countryCode: context.meta?.countryCode || null,
     countryName: context.meta?.countryName || null,
     ispName: context.meta?.ispName || null,
-    timezone: context.meta?.timezone || context.ipRisk?.location?.timezone || NODE_TIMEZONE || null,
+    timezone: context.ipRisk?.location?.timezone || context.meta?.timezone || NODE_TIMEZONE || null,
+    runtimeInfo: getRuntimeInfo(),
     bootId: bootInstanceId,
     metadata: {
       cfip: CFIP,
@@ -480,7 +537,7 @@ async function syncNodeRegistrationToTeamNode(context) {
   const payload = buildTeamNodePayload(context, { includeContent: true, runtimeStatus: "starting" });
   if (!payload) return null;
 
-  const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload, "nodejs_argo_register");
+  const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload);
   if (response && response.status === 200) {
     teamnodeSyncRegistered = true;
     console.log("TeamNode 注册成功");
@@ -498,7 +555,7 @@ async function syncNodeHeartbeatToTeamNode(context) {
   if (!payload) return null;
 
   try {
-    const response = await postTeamNodeSync("/api/internal/nodejs-argo/heartbeats", payload, "nodejs_argo_heartbeat");
+    const response = await postTeamNodeSync("/api/internal/nodejs-argo/heartbeats", payload);
     if (response && response.status === 200) {
       teamnodeSyncRegistered = true;
       console.log("TeamNode 心跳成功");
@@ -527,7 +584,7 @@ async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
   if (!payload.argoDomain) return null;
 
   try {
-    const response = await postTeamNodeSync("/api/internal/nodejs-argo/offline", payload, "nodejs_argo_offline");
+    const response = await postTeamNodeSync("/api/internal/nodejs-argo/offline", payload);
     if (response && response.status === 200) {
       teamnodeSyncRegistered = false;
       console.log("TeamNode 下线通知成功");
@@ -2011,7 +2068,7 @@ async function startserver() {
   try {
     acquireRuntimeLock();
     console.log(`启动配置：ARGO_DOMAIN=${ARGO_DOMAIN || "(empty)"}，ARGO_PORT=${ARGO_PORT}，SERVER_PORT=${PORT}`);
-    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，密钥${TEAMNODE_SYNC_SECRET ? "已配置" : "未配置"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
+    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode Worker：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，${TEAMNODE_SYNC_RELAY_TOKEN ? "使用预置中继令牌" : TEAMNODE_SYNC_ENROLL_PASSWORD ? "启动时兑换中继令牌" : "未配置兑换密码或中继令牌"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();
@@ -2077,7 +2134,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  createTeamNodeSyncHeaders,
   resolveCountryLabel,
   resolveTeamNodeProvider,
   buildDefaultNodeName,

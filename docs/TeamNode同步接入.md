@@ -1,127 +1,95 @@
-# TeamNode 同步接入
+# TeamNode Worker 中继同步
 
 ## 1. 目标
 
-为 `nodejs-argo` 增加对 TeamNode 的签名同步能力，在容器启动并生成节点订阅后：
+Docker 版 `nodejs-argo` 不再直接访问 `teamnode.lemon.vin`，而是通过已经部署好的 Worker 完成注册、心跳和下线：
 
-- 自动向 TeamNode 注册节点
-- 定时向 TeamNode 发送心跳
-- 进程退出时主动向 TeamNode 发送下线通知
-- 保持旧 `UPLOAD_URL` 上传逻辑兼容
-- 未配置 TeamNode 同步参数时，按原模式运行
+```text
+nodejs-argo Docker → https://install.lemon.vin Worker → https://teamnode.lemon.vin
+```
 
-## 2. 连接方式
+Docker 只持有兑换密码，Worker 才持有 `TEAMNODE_SYNC_SECRET`。这样外层 Docker 不需要保存 TeamNode 的上游签名密钥。
 
-`nodejs-argo` 通过公网 HTTPS 域名访问 TeamNode，例如：
+## 2. Worker 配置
 
-- `https://teamnode.lemon.vin/api/internal/nodejs-argo/registrations`
-- `https://teamnode.lemon.vin/api/internal/nodejs-argo/heartbeats`
+在 `install.lemon.vin` 对应的 Worker 运行机密中配置：
 
-这里的“内部同步”是指签名协议，不要求走内网。
+- `TEAMNODE_SYNC_SECRET`：Worker 转发到 `teamnode.lemon.vin` 时使用；
+- `TEAMNODE_SYNC_ENROLL_PASSWORD`：Docker 节点启动时用于兑换中继令牌。
 
-## 3. 环境变量
+这两个值只配置在 Worker，不要复制到 Docker 的环境变量中。Worker 提供以下接口：
+
+- `POST /api/teamnode/redeem`：使用 `{ password, uuid }` 兑换中继令牌；
+- `POST /api/internal/nodejs-argo/registrations`：注册节点；
+- `POST /api/internal/nodejs-argo/heartbeats`：发送心跳；
+- `POST /api/internal/nodejs-argo/offline`：发送下线通知。
+
+## 3. Docker 环境变量
 
 | 变量名 | 是否必须 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `TEAMNODE_SYNC_ENABLED` | 否 | 自动推断 | 是否启用 TeamNode 同步；默认只要存在 `TEAMNODE_SYNC_SECRET` 就会自动启用 |
-| `TEAMNODE_SYNC_BASE_URL` | 否 | `https://teamnode.lemon.vin` | TeamNode 基础地址 |
-| `TEAMNODE_SYNC_KEY_ID` | 否 | `nodejs-argo-prod` | TeamNode 内部同步 Key ID |
-| `TEAMNODE_SYNC_SECRET` | 否 | - | TeamNode 内部同步签名密钥；必须单独配置，不复用其他同步通道密钥 |
-| `TEAMNODE_SYNC_TIMEOUT_MS` | 否 | `10000` | 单次请求超时 |
-| `TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS` | 否 | `300000` | 心跳间隔，默认 5 分钟 |
-| `TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT` | 否 | `false` | 是否在每次心跳中携带最新 `contentBase64`；无 Docker 安装器默认开启 |
+| `TEAMNODE_SYNC_ENABLED` | 否 | 自动推断 | 配置兑换密码或中继令牌后自动启用 |
+| `TEAMNODE_SYNC_BASE_URL` | 否 | `https://install.lemon.vin` | Worker 中继地址 |
+| `TEAMNODE_SYNC_ENROLL_PASSWORD` | 使用密码兑换时必须 | - | Worker 上配置的兑换密码，只在兑换请求中使用，不写入日志 |
+| `TEAMNODE_SYNC_RELAY_TOKEN` | 否 | - | 可选预置中继令牌；配置后跳过密码兑换 |
+| `UUID` | 否 | 启动时随机生成 UUID v4 | 指定后用于 Xray、三种协议订阅和 Worker 注册/心跳 |
 | `TEAMNODE_SYNC_GROUP_KEY` | 否 | `basic` | TeamNode 节点分组 Key |
-| `TEAMNODE_SYNC_PROVIDER` | 否 | 自动生成 | TeamNode 供应商标识；默认按国家/地区缩写自动生成，如 `us`、`sin` |
-| `TEAMNODE_SYNC_LABEL_PREFIX` | 否 | 空 | TeamNode 节点标签前缀；默认直接使用国家名作为节点名称 |
+| `TEAMNODE_SYNC_PROVIDER` | 否 | 自动生成 | 默认按地区缩写生成，如 `us`、`kr`、`sin` |
+| `TEAMNODE_SYNC_LABEL_PREFIX` | 否 | 空 | 节点标签前缀 |
+| `TEAMNODE_SYNC_TIMEOUT_MS` | 否 | `10000` | 单次 Worker 请求超时 |
+| `TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS` | 否 | `300000` | 心跳间隔，默认 5 分钟 |
+| `TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT` | 否 | `true` | 心跳是否携带最新 `contentBase64` |
+
+推荐配置：
+
+```bash
+TEAMNODE_SYNC_BASE_URL=https://install.lemon.vin
+TEAMNODE_SYNC_ENROLL_PASSWORD=Worker上配置的兑换密码
+```
+
+如果使用预置令牌，则改为：
+
+```bash
+TEAMNODE_SYNC_BASE_URL=https://install.lemon.vin
+TEAMNODE_SYNC_RELAY_TOKEN=relay_v1_...
+```
+
+不要在 Docker 中设置 `TEAMNODE_SYNC_SECRET` 或旧的 `TEAMNODE_SYNC_KEY_ID`。
 
 ## 4. 上报数据
 
-注册时会上报：
+注册和心跳会携带：
 
-- `groupKey`
-- `label`
-- `provider`
-- `uuid`
-- `argoDomain`
-- `projectUrl`
-- `subPath`
-- `contentBase64`
-- `countryCode`
-- `countryName`
-- `ispName`
-- `bootId`
-- `metadata`
+- 节点 UUID、标签、`ARGO_DOMAIN`、供应商和分组；
+- 三种协议生成的最新订阅内容（按 `TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT` 控制心跳内容）；
+- IP 地理信息中的国家/地区、供应商和节点时区；
+- Docker 运行时信息：`platform`、`arch`、`osType`、`osRelease`、CPU 核数、内存；
+- `bootId`、运行状态和本地配置元数据。
 
-心跳时会上报：
+Worker 根据实际收到请求的 Cloudflare 信息补充：
 
-- `uuid`
-- `argoDomain`
-- `runtimeStatus`
-- `projectUrl`
-- `subPath`
-- `countryCode`
-- `countryName`
-- `ispName`
-- `bootId`
-- `metadata`
-- `contentBase64`（仅当 `TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT=true` 时）
+- 来源 IP（`CF-Connecting-IP`）；
+- Cloudflare 国家和接入 colo；
+- Worker 记录的最后心跳时间。
 
-主动下线时会上报：
+节点时区优先使用 IP 地理信息返回的时区，未获取时才回退到容器的 `NODE_TIMEZONE` 或 Node.js 默认时区。中国与节点时间是否显示两行由面板根据时区差异判断。
 
-- `uuid`
-- `argoDomain`
-- `reason`
+## 5. 运行流程
 
-## 5. 运行逻辑
+1. Docker 启动 Node.js、Xray、cloudflared 并生成 VLESS、VMess、Trojan 三种节点。
+2. 首次同步前，使用兑换密码和当前 UUID 请求 Worker 兑换令牌；密码不会写入日志。
+3. 使用 `x-teamnode-sync-relay-token` 请求 Worker 的注册接口。
+4. 注册成功后按间隔发送心跳；Worker 再转发到 `teamnode.lemon.vin`。
+5. Worker 返回未注册时自动重新注册；返回 401 时密码模式会重新兑换一次令牌。
+6. 进程收到 `SIGINT` 或 `SIGTERM` 时，尽力发送一次下线通知。
 
-1. `nodejs-argo` 启动并生成订阅
-2. 若配置了 TeamNode 同步参数，则先发送注册请求
-3. 注册成功后，启动定时心跳
-4. 若注册失败，不影响原有服务继续运行，只记录日志
-5. 若心跳返回“来源不存在”，下一个周期会自动重新注册
-6. 收到 `SIGINT / SIGTERM` 时，会 best-effort 发送一次下线通知
+兑换令牌只保存在当前 Node.js 进程内。进程重启后，密码模式会重新兑换，因此不会依赖旧进程内存中的令牌。
 
-### 5.1 推荐的最简部署方式
+未设置 `UUID` 时，每次 Node.js 进程启动会生成新的 UUID v4。若希望容器重启后仍显示为同一个节点，请显式设置并持久化 `UUID`。
 
-由于当前项目是私有项目，且 TeamNode 域名固定为 `teamnode.lemon.vin`，代码内已经提供以下默认值：
+## 6. 兼容性与范围
 
-- `TEAMNODE_SYNC_BASE_URL=https://teamnode.lemon.vin`
-- `TEAMNODE_SYNC_KEY_ID=nodejs-argo-prod`
-- `TEAMNODE_SYNC_GROUP_KEY=basic`
-- `TEAMNODE_SYNC_TIMEOUT_MS=10000`
-- `TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS=300000`
-
-同时会自动生成：
-
-- 默认节点名称：部署地国家名，例如 `美国`、`韩国`、`新加坡`、`日本`、`德国`
-- 默认供应商：国家/地区缩写，例如 `us`、`kr`、`sin`、`jp`、`de`
-
-因此多数部署场景只需要配置：
-
-```bash
-TEAMNODE_SYNC_SECRET=你的签名密钥
-```
-
-注意：
-
-- 这个密钥应当是专门给 `nodejs-argo -> TeamNode` 使用的一组新密钥
-- 代码内不再内置默认签名密钥，未配置时不会自动同步
-
-如需覆盖默认行为，再单独传入对应环境变量即可。
-
-## 6. 兼容性说明
-
-- 不影响旧的 `UPLOAD_URL` 上传逻辑
-- 不影响 `/sub` 输出
-- 不影响 Cloudflare 临时隧道和固定隧道的生成逻辑
-- 未配置 `TEAMNODE_SYNC_SECRET` 时，所有同步逻辑自动跳过
-
-## 7. 当前范围
-
-当前 `nodejs-argo` 侧仅实现：
-
-- 签名注册
-- 定时心跳
-- 主动下线通知
-- 启动后自动接入
-- 可选的心跳内容同步
+- 不影响 `UPLOAD_URL`、`/sub`、临时 Tunnel 和固定 Tunnel；
+- TeamNode Worker 不可用时，Xray、cloudflared 和订阅服务仍继续运行；
+- Docker 镜像继续支持 `linux/amd64` 与 `linux/arm64` 多架构构建；
+- 外层项目不再需要额外的 Agent、`start_lemon.py` 或 `nohup` 包裹进程。

@@ -132,7 +132,8 @@ docker run -d --name lemon-node --restart unless-stopped \
   "PLATFORM_PUBLIC_PORT": "443",
   "NAME": "<NAME>",
   "UUID": "<UUID>",
-  "TEAMNODE_SYNC_SECRET": "<TEAMNODE_SYNC_SECRET>"
+  "TEAMNODE_SYNC_BASE_URL": "https://install.lemon.vin",
+  "TEAMNODE_SYNC_ENROLL_PASSWORD": "<TEAMNODE_SYNC_ENROLL_PASSWORD>"
 }
 ```
 
@@ -145,6 +146,8 @@ docker run -d --name lemon-node --restart unless-stopped \
 ### Docker 镜像中的 cloudflared 自动更新
 
 GitHub Actions 会在每日定时构建、推送代码变更或手动执行工作流时，读取 cloudflared 官方最新稳定版本并重新构建 `ghcr.io/lemonllhon/nodejs:latest`。容器运行期间，cloudflared 也会每 24 小时自动检查并更新自身；重新创建容器后则使用镜像内置的最新版本。Dockerfile 中的版本仅作为本地构建时的兜底值。cloudflared 自更新会重启 Tunnel，单连接可能产生短暂重连。
+
+Docker 镜像继续由 Dockerfile 根据 `TARGETARCH` 安装对应的 cloudflared 和 Xray 二进制；GitHub Actions 同时构建并推送 `linux/amd64` 与 `linux/arm64` 镜像。
 
 ### 运行日志
 
@@ -182,7 +185,7 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | AUTO_ACCESS | 否 | false | 是否开启自动访问保活 |
 | PORT | 否 | 3000 | HTTP服务监听端口 |
 | ARGO_PORT | 否 | 8001 | Argo隧道端口 |
-| UUID | 否 | 89c13786-25aa-4520-b2e7-12cd60fb5202 | 用户UUID |
+| UUID | 否 | 启动时随机生成 UUID v4 | 用户 UUID；指定后始终使用指定值 |
 | ARGO_DOMAIN | 否 | - | Argo固定隧道域名 |
 | ARGO_AUTH | 否 | - | Argo固定隧道密钥 |
 | CFIP | 否 | www.cloudflare.com | 节点优选域名或IP |
@@ -218,16 +221,18 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | PROCESS_START_TIMEOUT_MS | 否 | 15000 | 进程启动和协议端口检查超时时间（毫秒） |
 | TEMP_TUNNEL_DISCOVERY_TIMEOUT_MS | 否 | 90000 | 每次等待临时 Tunnel 域名的时间（毫秒） |
 | TEMP_TUNNEL_MAX_ATTEMPTS | 否 | 3 | 临时 Tunnel 域名发现失败后的最大尝试次数 |
-| TEAMNODE_SYNC_ENABLED | 否 | 自动推断 | 是否启用 TeamNode 同步；默认只要配置了 `TEAMNODE_SYNC_SECRET` 就会自动启用 |
-| TEAMNODE_SYNC_BASE_URL | 否 | `https://teamnode.lemon.vin` | TeamNode 地址 |
-| TEAMNODE_SYNC_KEY_ID | 否 | `nodejs-argo-prod` | TeamNode 内部同步 Key ID |
-| TEAMNODE_SYNC_SECRET | 否 | - | TeamNode 内部同步签名密钥 |
+| TEAMNODE_SYNC_ENABLED | 否 | 自动推断 | 是否启用 TeamNode 同步；默认配置 `TEAMNODE_SYNC_ENROLL_PASSWORD` 或 `TEAMNODE_SYNC_RELAY_TOKEN` 后自动启用 |
+| TEAMNODE_SYNC_BASE_URL | 否 | `https://install.lemon.vin` | Worker 中继地址；程序会访问其兑换和内部中继接口 |
+| TEAMNODE_SYNC_ENROLL_PASSWORD | 使用密码兑换时必须 | - | Worker 上配置的兑换密码；只用于启动时兑换中继令牌，不会写入日志或发送给 TeamNode |
+| TEAMNODE_SYNC_RELAY_TOKEN | 否 | - | 可选的预置中继令牌；配置后跳过兑换密码，优先使用该令牌 |
 | TEAMNODE_SYNC_GROUP_KEY | 否 | basic | TeamNode 节点分组 Key |
 | TEAMNODE_SYNC_PROVIDER | 否 | 自动生成 | TeamNode 节点供应商标识，默认按国家/地区缩写自动生成，如 `us`、`sin` |
 | TEAMNODE_SYNC_LABEL_PREFIX | 否 | 空 | TeamNode 节点标签前缀，默认直接使用国家名作为节点名称 |
 | TEAMNODE_SYNC_TIMEOUT_MS | 否 | 10000 | TeamNode 同步请求超时 |
 | TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS | 否 | 300000 | TeamNode 心跳间隔（毫秒） |
-| TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT | 否 | false | 是否在每次心跳中携带最新 `contentBase64`；无 Docker 安装器默认开启 |
+| TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT | 否 | true | 是否在每次心跳中携带最新 `contentBase64` |
+
+未设置 `UUID` 时，程序会在每次 Node.js 进程启动时生成一个新的 UUID v4，并将同一个值用于 Xray、三种协议订阅以及 Worker 注册/心跳。需要在容器重启后保持节点身份不变时，请显式设置 `UUID`，并持久化该环境变量。
 
 ## 🌐 订阅地址
 
@@ -236,31 +241,24 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 
 ## TeamNode 同步
 
-配置 `TEAMNODE_SYNC_BASE_URL`、`TEAMNODE_SYNC_KEY_ID`、`TEAMNODE_SYNC_SECRET` 后，`nodejs-argo` 会在生成订阅后自动：
+配置 `TEAMNODE_SYNC_ENROLL_PASSWORD` 后，`nodejs-argo` 会在生成订阅后自动：
 
-- 向 TeamNode 注册节点
-- 定时向 TeamNode 发送心跳
-- 在 `SIGINT / SIGTERM` 时 best-effort 发送下线通知
-- 保持原有 `UPLOAD_URL` 逻辑兼容
+- 向 `https://install.lemon.vin/api/teamnode/redeem` 发送密码和 UUID，兑换中继令牌；
+- 通过 Worker 的 `/api/internal/nodejs-argo/registrations`、`/heartbeats` 和 `/offline` 接口注册、心跳和下线；
+- 由 Worker 在服务端使用其机密转发到 `https://teamnode.lemon.vin`；Docker 容器不再保存或使用 `TEAMNODE_SYNC_SECRET`；
+- 上报容器操作系统、架构、CPU 核数、内存和节点时区；Worker 同时记录来源 IP、Cloudflare 地区/colo 和 Worker 收到心跳的时间；
+- 在 `SIGINT / SIGTERM` 时 best-effort 发送下线通知；
+- 保持原有 `UPLOAD_URL` 逻辑兼容。
 
-如果你使用默认 TeamNode：
-
-- `TEAMNODE_SYNC_BASE_URL=https://teamnode.lemon.vin`
-- `TEAMNODE_SYNC_KEY_ID=nodejs-argo-prod`
-- `TEAMNODE_SYNC_GROUP_KEY=basic`
-
-那么部署时通常只需要配置：
+默认 Worker 地址为 `https://install.lemon.vin`，默认分组为 `basic`。部署时通常只需要增加：
 
 ```bash
-TEAMNODE_SYNC_SECRET=你的签名密钥
+TEAMNODE_SYNC_ENROLL_PASSWORD=Worker 上配置的兑换密码
 ```
 
-注意：
+也可以提前获得中继令牌后配置 `TEAMNODE_SYNC_RELAY_TOKEN`，这样会跳过兑换密码。每次 Docker 进程重启时，密码模式会重新兑换令牌；兑换失败不会阻止 Xray、cloudflared 和订阅服务启动，只会记录 TeamNode 同步错误。
 
-- `TEAMNODE_SYNC_SECRET` 必须是专门给 `nodejs-argo` 使用的一组独立签名密钥
-- 代码内不再内置默认签名密钥；未配置时不会自动同步到 TeamNode
-- 默认节点名称会自动使用部署地国家名，例如 `美国`、`韩国`、`新加坡`
-- 默认供应商会自动使用国家/地区缩写，例如 `us`、`kr`、`sin`
+注意：`TEAMNODE_SYNC_SECRET` 只应配置在 Worker 的运行机密中，不要再放入 Docker 环境变量。默认节点名称会自动使用部署地国家名，例如 `美国`、`韩国`、`新加坡`；默认供应商会自动使用国家/地区缩写，例如 `us`、`kr`、`sin`。
 
 详细说明见：`docs/TeamNode同步接入.md`
 
