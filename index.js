@@ -7,6 +7,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const net = require("net");
+const https = require("https");
 const { promisify } = require("util");
 const { exec: childExec, spawn } = require("child_process");
 const exec = promisify(childExec);
@@ -84,12 +85,26 @@ const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "basic";
 const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "";
 const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
 const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
-const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
+// Worker 默认 6 分钟判定心跳超时。Docker 心跳必须明显短于该阈值，
+// 避免定时器抖动或网络请求耗时造成“节点仍在运行但被面板删除”的竞态。
+const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "120000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
   process.env.TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
   true
 );
+const TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS = Number.parseInt(
+  process.env.TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS || "15000",
+  10
+);
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
+const CLOUDFLARED_TUNNEL_PORT = 7844;
+const TUNNEL_CONNECTIVITY_FAILURE_THRESHOLD = 3;
+const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
+const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
+const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
+const NODEJS_ARGO_VARIANT = "docker";
+const TEAMNODE_IPV4_HTTPS_AGENT = new https.Agent({ family: 4, keepAlive: true });
+const TEAMNODE_IPV6_HTTPS_AGENT = new https.Agent({ family: 6, keepAlive: true });
 const MANAGED_PROCESS_RESTART_DELAY_MS = Number.parseInt(
   process.env.MANAGED_PROCESS_RESTART_DELAY_MS || "5000",
   10
@@ -157,6 +172,11 @@ let teamnodeSyncTimer = null;
 let teamnodeSyncRegistered = false;
 let teamnodeSyncContext = null;
 let teamnodeShutdownPromise = null;
+let teamnodeHeartbeatPromise = null;
+let tunnelTestCommandPollTimer = null;
+let tunnelTestCommandPollPromise = null;
+let tunnelConnectivityFailureStreak = 0;
+let lastTunnelConnectivity = null;
 let directCertificateRenewalTimer = null;
 let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
@@ -468,7 +488,7 @@ async function redeemTeamNodeRelayToken() {
   return teamnodeSyncRelayToken;
 }
 
-async function postTeamNodeSync(relativePath, payload) {
+async function postTeamNodeSync(relativePath, payload, { ipFamily = 0 } = {}) {
   const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
   if (!baseUrl) return null;
 
@@ -476,12 +496,18 @@ async function postTeamNodeSync(relativePath, payload) {
   const timeout = Number.isFinite(TEAMNODE_SYNC_TIMEOUT_MS) && TEAMNODE_SYNC_TIMEOUT_MS > 0
     ? TEAMNODE_SYNC_TIMEOUT_MS
     : 10000;
+  const requestedFamily = ipFamily === 6 ? 6 : ipFamily === 4 ? 4 : 0;
   const send = async (relayToken) => axios.post(requestUrl.toString(), payload, {
     headers: {
       "Content-Type": "application/json",
       "x-teamnode-sync-relay-token": relayToken
     },
-    timeout
+    timeout,
+    ...(requestedFamily === 4
+      ? { httpsAgent: TEAMNODE_IPV4_HTTPS_AGENT }
+      : requestedFamily === 6
+        ? { httpsAgent: TEAMNODE_IPV6_HTTPS_AGENT }
+        : {})
   });
 
   const relayToken = await redeemTeamNodeRelayToken();
@@ -495,6 +521,233 @@ async function postTeamNodeSync(relativePath, payload) {
     }
     throw error;
   }
+}
+
+function tunnelConnectivityProtocols() {
+  const protocol = getCloudflaredProtocol();
+  if (protocol === "http2") return ["TCP"];
+  if (protocol === "quic") return ["UDP"];
+  return ["TCP", "UDP"];
+}
+
+function probeTcpPort(host, port, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const finish = (open, reason = "") => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({
+        open,
+        reason,
+        latencyMs: Math.max(0, Date.now() - startedAt)
+      });
+    };
+    socket.setTimeout(timeoutMs, () => finish(false, "timeout"));
+    socket.once("connect", () => finish(true, "connected"));
+    socket.once("error", (error) => finish(false, String(error?.code || error?.message || "connect_error")));
+  });
+}
+
+async function probeCloudflareEdgeTransport() {
+  const protocol = getCloudflaredProtocol();
+  if (protocol === "quic") {
+    // 普通 UDP connect 无法证明 QUIC 握手成功；最终以 cloudflared 进程和
+    // Worker 对 ARGO_DOMAIN 的公网 WebSocket 回访为准。
+    return { checked: false, open: false, latencyMs: null, reason: "quic_verified_by_tunnel_route" };
+  }
+
+  const results = await Promise.all([
+    probeTcpPort("region1.v2.argotunnel.com", CLOUDFLARED_TUNNEL_PORT),
+    probeTcpPort("region2.v2.argotunnel.com", CLOUDFLARED_TUNNEL_PORT)
+  ]);
+  const connected = results.find((result) => result.open);
+  return connected
+    ? { checked: true, open: true, latencyMs: connected.latencyMs, reason: "edge_reachable" }
+    : { checked: true, open: false, latencyMs: null, reason: results[0]?.reason || "edge_unreachable" };
+}
+
+async function probePublicRoute({ domain, mode = "tunnel", port = CLOUDFLARED_TUNNEL_PORT, httpPort = null, tlsEnabled = true, family = null }) {
+  const response = await postTeamNodeSync(PUBLIC_ROUTE_PROBE_PATH, {
+    uuid: UUID,
+    domain,
+    mode,
+    port,
+    ...(Number.isInteger(httpPort) ? { httpPort } : {}),
+    tlsEnabled,
+    ...(family ? { family } : {})
+  }, { ipFamily: family === "ipv6" ? 6 : family === "ipv4" ? 4 : 0 });
+  return response?.data || null;
+}
+
+function managedCloudflaredIsRunning() {
+  const record = managedChildren.get("cloudflared");
+  return Boolean(record && isManagedChildRunning(record.child));
+}
+
+async function checkCloudflareTunnelConnectivity(domain, { force = false } = {}) {
+  const checkedAt = Date.now();
+  const requiredProtocols = tunnelConnectivityProtocols();
+  const protocol = getCloudflaredProtocol();
+  const processRunning = managedCloudflaredIsRunning();
+  const [transport, publicProbeResult] = await Promise.all([
+    probeCloudflareEdgeTransport().catch((error) => ({
+      checked: false,
+      open: false,
+      latencyMs: null,
+      reason: String(error?.code || error?.message || "edge_probe_failed")
+    })),
+    probePublicRoute({ domain, mode: "tunnel" }).catch((error) => ({
+      ok: false,
+      externalStatus: "unknown",
+      checkedAt,
+      httpStatus: null,
+      reason: String(error?.response?.data?.error || error?.code || error?.message || "public_probe_failed").slice(0, 64)
+    }))
+  ]);
+
+  const publicReachable = publicProbeResult?.ok === true
+    && publicProbeResult?.externalStatus === "reachable";
+  if (processRunning && publicReachable) {
+    tunnelConnectivityFailureStreak = 0;
+  } else {
+    tunnelConnectivityFailureStreak += 1;
+  }
+
+  const confirmedFailure = force
+    || tunnelConnectivityFailureStreak >= TUNNEL_CONNECTIVITY_FAILURE_THRESHOLD;
+  const publicProbeStatus = publicReachable
+    ? "reachable"
+    : confirmedFailure && publicProbeResult?.externalStatus === "blocked"
+      ? "blocked"
+      : "unknown";
+  const connectivity = {
+    mode: "tunnel",
+    status: processRunning && publicReachable
+      ? "connected"
+      : confirmedFailure
+        ? processRunning ? "degraded" : "offline"
+        : "unknown",
+    checkedAt,
+    protocol,
+    requiredProtocols,
+    port: CLOUDFLARED_TUNNEL_PORT,
+    portStatus: publicReachable || transport.open
+      ? "open"
+      : confirmedFailure && transport.checked
+        ? "blocked"
+        : "unknown",
+    publicProbeStatus,
+    publicProbeAt: Number(publicProbeResult?.checkedAt || checkedAt),
+    publicProbeReason: String(publicProbeResult?.reason || "unknown").slice(0, 64),
+    publicProbeHttpStatus: Number.isFinite(Number(publicProbeResult?.httpStatus))
+      ? Number(publicProbeResult.httpStatus)
+      : null,
+    httpStatus: Number.isFinite(Number(publicProbeResult?.httpStatus))
+      ? Number(publicProbeResult.httpStatus)
+      : null,
+    latencyMs: Number.isFinite(Number(transport.latencyMs)) ? Number(transport.latencyMs) : null,
+    reason: processRunning && publicReachable
+      ? "public_route_reachable"
+      : !confirmedFailure
+        ? "tunnel_verifying"
+        : !processRunning
+          ? "cloudflared_process_unavailable"
+          : String(publicProbeResult?.reason || transport.reason || "tunnel_probe_failed").slice(0, 64)
+  };
+  lastTunnelConnectivity = connectivity;
+  return connectivity;
+}
+
+function configuredRouteMode() {
+  if (DIRECT_MODE) return "direct";
+  if (PLATFORM_PROXY_MODE) return "platform";
+  return "tunnel";
+}
+
+async function checkConfiguredRouteConnectivity(domain, ipRisk = null, { force = false } = {}) {
+  const mode = configuredRouteMode();
+  if (mode === "tunnel") {
+    return checkCloudflareTunnelConnectivity(domain, { force });
+  }
+
+  const checkedAt = Date.now();
+  const riskIp = String(ipRisk?.ip || "").trim();
+  const primaryFamily = net.isIP(riskIp) === 6 ? "ipv6" : "ipv4";
+  const routePort = mode === "direct" ? DIRECT_PORT : PLATFORM_PUBLIC_PORT;
+  if (mode === "direct") {
+    // IPv4/IPv6 回访会并发发起，先完成一次令牌兑换，避免两个地址族重复兑换。
+    await redeemTeamNodeRelayToken();
+  }
+  const probeOne = (family = null) => probePublicRoute({
+    domain,
+    mode,
+    port: routePort,
+    httpPort: mode === "direct" ? DIRECT_HTTP_PORT : null,
+    tlsEnabled: true,
+    family
+  }).catch((error) => ({
+    ok: false,
+    externalStatus: "unknown",
+    checkedAt,
+    httpStatus: null,
+    reason: String(error?.response?.data?.error || error?.code || error?.message || "public_probe_failed").slice(0, 64)
+  }));
+  const familyResults = mode === "direct"
+    ? await Promise.all(["ipv4", "ipv6"].map(async (family) => [family, await probeOne(family)]))
+    : [["platform", await probeOne(null)]];
+  const resultByFamily = Object.fromEntries(familyResults);
+  const successfulFamilies = mode === "direct"
+    ? ["ipv4", "ipv6"].filter((family) => (
+      resultByFamily[family]?.ok === true && resultByFamily[family]?.externalStatus === "reachable"
+    ))
+    : [];
+  const primaryResult = resultByFamily[primaryFamily] || resultByFamily.platform || null;
+  const result = successfulFamilies.length > 0
+    ? resultByFamily[successfulFamilies[0]]
+    : primaryResult;
+  const reachable = result?.ok === true && result?.externalStatus === "reachable";
+  const blocked = result?.externalStatus === "blocked";
+  const publicProbeFamilies = {};
+  if (mode === "direct") {
+    for (const family of ["ipv4", "ipv6"]) {
+      const familyResult = resultByFamily[family];
+      if (!familyResult || !["reachable", "blocked"].includes(familyResult.externalStatus)) continue;
+      publicProbeFamilies[family] = {
+        ok: familyResult.ok === true,
+        externalStatus: familyResult.externalStatus,
+        reason: String(familyResult.reason || "unknown").slice(0, 64),
+        host: familyResult.host || null,
+        httpStatus: Number.isFinite(Number(familyResult.httpStatus)) ? Number(familyResult.httpStatus) : null
+      };
+    }
+  }
+  const connectivity = {
+    mode,
+    status: reachable ? "connected" : blocked ? "offline" : "unknown",
+    checkedAt,
+    protocol: "https",
+    requiredProtocols: ["TCP"],
+    port: routePort,
+    portStatus: mode === "direct" ? reachable ? "open" : blocked ? "blocked" : "unknown" : "not_checked",
+    publicProbeStatus: reachable ? "reachable" : blocked ? "blocked" : "unknown",
+    publicProbeAt: Number(result?.checkedAt || checkedAt),
+    publicProbeReason: String(result?.reason || "unknown").slice(0, 64),
+    publicProbeHttpStatus: Number.isFinite(Number(result?.httpStatus)) ? Number(result.httpStatus) : null,
+    httpStatus: Number.isFinite(Number(result?.httpStatus)) ? Number(result.httpStatus) : null,
+    latencyMs: null,
+    reason: reachable ? "public_route_reachable" : String(result?.reason || "public_probe_failed").slice(0, 64),
+    directPort: mode === "direct" ? DIRECT_PORT : null,
+    directHttpPort: mode === "direct" ? DIRECT_HTTP_PORT : null,
+    directAddressFamilies: successfulFamilies,
+    publicProbeFamilies,
+    tlsEnabled: true,
+    cloudflareProxied: false
+  };
+  lastTunnelConnectivity = connectivity;
+  return connectivity;
 }
 
 function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = "starting" } = {}) {
@@ -514,6 +767,7 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
     ispName: context.meta?.ispName || null,
     timezone: context.ipRisk?.location?.timezone || context.meta?.timezone || NODE_TIMEZONE || null,
     runtimeInfo: getRuntimeInfo(),
+    tunnelConnectivity: context.tunnelConnectivity || lastTunnelConnectivity || null,
     bootId: bootInstanceId,
     metadata: {
       cfip: CFIP,
@@ -521,6 +775,13 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
       nodeName: context.nodeName || "",
       projectUrl: PROJECT_URL || "",
       subPath: SUB_PATH || "",
+      deploymentType: NODEJS_ARGO_VARIANT,
+      routeMode: context.tunnelConnectivity?.mode || configuredRouteMode(),
+      heartbeatIntervalMs: Number.isFinite(TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS)
+        ? TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS
+        : 120000,
+      sourceIpv4: context.publicAddresses?.ipv4 || null,
+      sourceIpv6: context.publicAddresses?.ipv6 || null,
       ipRisk: context.ipRisk || null
     }
   };
@@ -537,16 +798,27 @@ async function syncNodeRegistrationToTeamNode(context) {
   const payload = buildTeamNodePayload(context, { includeContent: true, runtimeStatus: "starting" });
   if (!payload) return null;
 
-  const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload);
-  if (response && response.status === 200) {
-    teamnodeSyncRegistered = true;
-    console.log("TeamNode 注册成功");
-    return response.data || null;
+  try {
+    const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload);
+    if (response && response.status === 200) {
+      teamnodeSyncRegistered = true;
+      console.log(response.data?.forwarded === false
+        ? `Docker ${configuredRouteMode()} 路线尚未通过验证：本次注册未转发 TeamNode`
+        : "TeamNode 注册成功");
+      return response.data || null;
+    }
+    return null;
+  } catch (error) {
+    if (error?.response?.status === 409) {
+      teamnodeSyncRegistered = true;
+      console.log("TeamNode 已存在相同 UUID，改用心跳复用原节点");
+      return syncNodeHeartbeatToTeamNode(context, { reRegisterOnMissing: false });
+    }
+    throw error;
   }
-  return null;
 }
 
-async function syncNodeHeartbeatToTeamNode(context) {
+async function syncNodeHeartbeatToTeamNode(context, { reRegisterOnMissing = true } = {}) {
   if (!isTeamNodeSyncConfigured() || !context) return null;
   const payload = buildTeamNodePayload(context, {
     includeContent: TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
@@ -558,13 +830,19 @@ async function syncNodeHeartbeatToTeamNode(context) {
     const response = await postTeamNodeSync("/api/internal/nodejs-argo/heartbeats", payload);
     if (response && response.status === 200) {
       teamnodeSyncRegistered = true;
-      console.log("TeamNode 心跳成功");
+      console.log(response.data?.forwarded === false
+        ? `Docker ${configuredRouteMode()} 路线仍未通过验证：本次心跳未转发 TeamNode`
+        : "TeamNode 心跳成功");
       return response.data || null;
     }
     return null;
   } catch (error) {
     if (error?.response?.status === 404) {
       teamnodeSyncRegistered = false;
+      if (!reRegisterOnMissing) {
+        console.log("TeamNode 原 UUID 注册记录与心跳状态不一致，等待下次同步重试");
+        return null;
+      }
       console.log("TeamNode 未找到来源节点，自动重新注册");
       return syncNodeRegistrationToTeamNode(context);
     }
@@ -578,6 +856,7 @@ async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
   const payload = {
     uuid: UUID,
     argoDomain: context.argoDomain,
+    tunnelConnectivity: context.tunnelConnectivity || lastTunnelConnectivity || null,
     reason: String(reason || "process_shutdown").trim() || "process_shutdown"
   };
 
@@ -609,10 +888,30 @@ async function syncNodeToTeamNode(context) {
   const ipRisk = context.ipRisk && !teamnodeSyncRegistered
     ? context.ipRisk
     : await resolveTeamNodeIpRiskInfo();
+  const tunnelConnectivity = await checkConfiguredRouteConnectivity(context.argoDomain, ipRisk);
+  const riskIp = String(ipRisk?.ip || context.ipRisk?.ip || "").trim();
+  const publicAddresses = {
+    ipv4: net.isIP(riskIp) === 4 ? riskIp : null,
+    ipv6: net.isIP(riskIp) === 6 ? riskIp : null
+  };
+  for (const family of ["ipv4", "ipv6"]) {
+    const probedHost = String(tunnelConnectivity.publicProbeFamilies?.[family]?.host || "").trim();
+    if (net.isIP(probedHost) === (family === "ipv4" ? 4 : 6)) {
+      publicAddresses[family] = probedHost;
+    }
+  }
   const syncContext = {
     ...context,
-    ipRisk
+    ipRisk,
+    publicAddresses,
+    tunnelConnectivity
   };
+
+  console.log(
+    `Docker ${tunnelConnectivity.mode} 路由连通性：${tunnelConnectivity.status}；`
+    + `${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port} ${tunnelConnectivity.portStatus}；`
+    + `Worker 公网回访：${tunnelConnectivity.publicProbeStatus}`
+  );
 
   teamnodeSyncContext = syncContext;
 
@@ -626,6 +925,120 @@ async function syncNodeToTeamNode(context) {
     console.error(`TeamNode 同步失败${status}: ${message}`);
     return null;
   }
+}
+
+function tunnelTestCommandPollInterval() {
+  return Number.isFinite(TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS)
+    && TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS >= 5000
+    ? Math.min(TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS, 60000)
+    : 15000;
+}
+
+async function reportTunnelTestResult(command, tunnelConnectivity, startedAt) {
+  const completedAt = Date.now();
+  const tunnelTest = {
+    commandId: String(command?.commandId || "").slice(0, 128),
+    type: String(command?.type || "cloudflare_tunnel_connectivity").slice(0, 64),
+    status: "completed",
+    requestedAt: Number(command?.requestedAt || completedAt),
+    startedAt,
+    completedAt,
+    updatedAt: completedAt,
+    reason: "node_test_completed"
+  };
+  const response = await postTeamNodeSync(TUNNEL_TEST_RESULTS_PATH, {
+    uuid: UUID,
+    tunnelTest,
+    tunnelConnectivity
+  });
+  if (!response || response.status !== 200) {
+    throw new Error(`tunnel_test_result_rejected_${response?.status || "unknown"}`);
+  }
+  return response.data || null;
+}
+
+async function executeTunnelTestCommand(command) {
+  const startedAt = Date.now();
+  try {
+    const tunnelConnectivity = await checkConfiguredRouteConnectivity(
+      teamnodeSyncContext?.argoDomain || ARGO_DOMAIN,
+      teamnodeSyncContext?.ipRisk || null,
+      { force: true }
+    );
+    if (teamnodeSyncContext) {
+      teamnodeSyncContext = { ...teamnodeSyncContext, tunnelConnectivity };
+    }
+    await reportTunnelTestResult(command, tunnelConnectivity, startedAt);
+    console.log(
+      `Docker ${tunnelConnectivity.mode} 路由立即检测完成：${tunnelConnectivity.requiredProtocols.join("/")} `
+      + `${tunnelConnectivity.port} ${tunnelConnectivity.portStatus}；路由状态=${tunnelConnectivity.status}`
+    );
+  } catch (error) {
+    const completedAt = Date.now();
+    try {
+      await postTeamNodeSync(TUNNEL_TEST_RESULTS_PATH, {
+        uuid: UUID,
+        tunnelTest: {
+          commandId: String(command?.commandId || "").slice(0, 128),
+          type: String(command?.type || "cloudflare_tunnel_connectivity").slice(0, 64),
+          status: "failed",
+          requestedAt: Number(command?.requestedAt || completedAt),
+          startedAt,
+          completedAt,
+          updatedAt: completedAt,
+          reason: "node_test_error"
+        }
+      });
+    } catch (reportError) {
+      console.error(`Docker 当前路由检测结果回传失败：${reportError.message}`);
+    }
+    console.error(`Docker 当前路由立即检测失败：${error.message}`);
+  }
+}
+
+async function pollTunnelTestCommands() {
+  if (!isTeamNodeSyncConfigured() || !teamnodeSyncRegistered || !teamnodeSyncContext || tunnelTestCommandPollPromise) {
+    return null;
+  }
+  tunnelTestCommandPollPromise = (async () => {
+    const response = await postTeamNodeSync(TUNNEL_TEST_COMMANDS_PATH, { uuid: UUID });
+    const commands = Array.isArray(response?.data?.commands) ? response.data.commands.slice(0, 1) : [];
+    for (const command of commands) {
+      if (String(command?.type || "") !== "cloudflare_tunnel_connectivity") continue;
+      await executeTunnelTestCommand(command);
+    }
+    return commands;
+  })()
+    .catch((error) => {
+      if (error?.response?.status !== 404) {
+        console.error(`Docker Tunnel 检测指令获取失败：${error.message}`);
+      }
+      return null;
+    })
+    .finally(() => {
+      tunnelTestCommandPollPromise = null;
+    });
+  return tunnelTestCommandPollPromise;
+}
+
+function stopTunnelTestCommandPollLoop() {
+  if (tunnelTestCommandPollTimer) {
+    clearInterval(tunnelTestCommandPollTimer);
+    tunnelTestCommandPollTimer = null;
+  }
+}
+
+function startTunnelTestCommandPollLoop() {
+  if (!isTeamNodeSyncConfigured() || tunnelTestCommandPollTimer) return;
+  stopTunnelTestCommandPollLoop();
+  const intervalMs = tunnelTestCommandPollInterval();
+  tunnelTestCommandPollTimer = setInterval(() => {
+    pollTunnelTestCommands().catch(() => null);
+  }, intervalMs);
+  if (typeof tunnelTestCommandPollTimer.unref === "function") {
+    tunnelTestCommandPollTimer.unref();
+  }
+  pollTunnelTestCommands().catch(() => null);
 }
 
 function stopTeamNodeHeartbeatLoop() {
@@ -643,12 +1056,17 @@ function startTeamNodeHeartbeatLoop(context) {
 
   const intervalMs = Number.isFinite(TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS) && TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS >= 30000
     ? TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS
-    : 300000;
+    : 120000;
 
   teamnodeSyncTimer = setInterval(() => {
-    if (!teamnodeSyncContext) return;
-    syncNodeToTeamNode(teamnodeSyncContext).catch(() => null);
+    if (!teamnodeSyncContext || teamnodeHeartbeatPromise) return;
+    teamnodeHeartbeatPromise = syncNodeToTeamNode(teamnodeSyncContext)
+      .catch(() => null)
+      .finally(() => {
+        teamnodeHeartbeatPromise = null;
+      });
   }, intervalMs);
+  startTunnelTestCommandPollLoop();
 }
 
 async function shutdownTeamNodeSync(reason = "process_shutdown") {
@@ -657,6 +1075,7 @@ async function shutdownTeamNodeSync(reason = "process_shutdown") {
   }
 
   stopTeamNodeHeartbeatLoop();
+  stopTunnelTestCommandPollLoop();
 
   teamnodeShutdownPromise = (async () => {
     try {
@@ -1150,6 +1569,15 @@ function nginxConfigValue(value) {
   return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+function localIpv6Available() {
+  try {
+    return fs.existsSync("/proc/net/if_inet6")
+      && Boolean(fs.readFileSync("/proc/net/if_inet6", "utf8").trim());
+  } catch {
+    return false;
+  }
+}
+
 function getDirectCertificatePaths() {
   if (DIRECT_CERT_FILE && DIRECT_KEY_FILE) {
     return {
@@ -1173,6 +1601,7 @@ function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly =
   const accessLogPath = path.resolve(directNginxAccessLogPath);
   const errorLogPath = path.resolve(directNginxErrorLogPath);
   const httpsPortSuffix = DIRECT_PORT === 443 ? "" : `:${DIRECT_PORT}`;
+  const enableIpv6Listen = localIpv6Available();
   const proxyHeaders = [
     "proxy_http_version 1.1;",
     "proxy_set_header Upgrade $http_upgrade;",
@@ -1213,6 +1642,7 @@ function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly =
     "",
     "  server {",
     `    listen ${DIRECT_HTTP_PORT};`,
+    ...(enableIpv6Listen ? [`    listen [::]:${DIRECT_HTTP_PORT} ipv6only=on;`] : []),
     `    server_name ${domain};`,
     "",
     "    location ^~ /.well-known/acme-challenge/ {",
@@ -1231,6 +1661,7 @@ function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly =
       "",
       "  server {",
       `    listen ${DIRECT_PORT} ssl;`,
+      ...(enableIpv6Listen ? [`    listen [::]:${DIRECT_PORT} ssl ipv6only=on;`] : []),
       `    server_name ${domain};`,
       `    ssl_certificate ${nginxConfigValue(path.resolve(certificateFile))};`,
       `    ssl_certificate_key ${nginxConfigValue(path.resolve(keyFile))};`,
@@ -2068,7 +2499,13 @@ async function startserver() {
   try {
     acquireRuntimeLock();
     console.log(`启动配置：ARGO_DOMAIN=${ARGO_DOMAIN || "(empty)"}，ARGO_PORT=${ARGO_PORT}，SERVER_PORT=${PORT}`);
-    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode Worker：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，${TEAMNODE_SYNC_RELAY_TOKEN ? "使用预置中继令牌" : TEAMNODE_SYNC_ENROLL_PASSWORD ? "启动时兑换中继令牌" : "未配置兑换密码或中继令牌"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
+    const routeMode = configuredRouteMode();
+    const routeDescription = routeMode === "direct"
+      ? `直连模式（${ARGO_DOMAIN}:${DIRECT_PORT}）`
+      : routeMode === "platform"
+        ? `平台代理模式（${ARGO_DOMAIN}:${PLATFORM_PUBLIC_PORT}）`
+        : `Cloudflare Tunnel（${ARGO_AUTH ? "已配置认证" : "临时隧道"}）`;
+    console.log(`当前路由：${routeDescription}；TeamNode Worker：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，${TEAMNODE_SYNC_RELAY_TOKEN ? "使用预置中继令牌" : TEAMNODE_SYNC_ENROLL_PASSWORD ? "启动时兑换中继令牌" : "未配置兑换密码或中继令牌"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();

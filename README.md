@@ -23,125 +23,28 @@ Telegram交流反馈群组：https://t.me/eooceu
 * node玩具平台只需上传index.js和package.json即可，paas平台需要docker部署的才上传Dockerfile。
 * 不填写ARGO_DOMAIN和ARGO_AUTH两个变量即启用临时隧道，反之则使用固定隧道。
 
-### 直连模式（绕过 Cloudflare Tunnel）
+### Docker 路由模式
 
-如果 Cloudflare 边缘节点拦截 WebSocket，或希望节点直接连接 Docker 主机，可以设置 `DIRECT_MODE=true`。此模式使用 Nginx 接收 HTTPS，再把三个 WebSocket 路径转发给容器内的 Xray，同时保留根路径网页。
+Docker 默认使用 **Cloudflare Tunnel 模式**，同时保留显式启用的直连模式、平台代理模式和直连 DNS 自动维护能力。三种路线不会自动互相切换：不设置 `DIRECT_MODE` 或 `PLATFORM_PROXY_MODE` 时才走 Tunnel。
 
-直连模式不需要 `ARGO_AUTH`、`CFIP` 或用户配置的 `ARGO_PORT`。请将 `ARGO_DOMAIN` 的 DNS A/AAAA 记录直接指向服务器公网 IP，并在 Docker 主机发布 80、443 端口；如果 DNS 仍然是 Cloudflare 橙云，流量仍会经过 Cloudflare。
+固定 Tunnel 至少配置 `ARGO_AUTH`、`ARGO_DOMAIN` 和 `UUID`；`ARGO_PORT` 默认 `8001`，Cloudflare Tunnel 后台的 Service 应指向 `http://localhost:8001`。容器只需具备出站 TCP/UDP 7844 和访问 `install.lemon.vin:443` 的能力，不需要向公网开放入站 7844。
 
-证书有两种方式：
+启用监控时，三种模式都会向 `install.lemon.vin` 注册、心跳和上报当前路线：
 
-* 配置 `DIRECT_CERT_FILE` 和 `DIRECT_KEY_FILE`，挂载已有证书；
-* 配置 `DIRECT_LETSENCRYPT_EMAIL`（默认 `admin@lemon.vin`），容器会通过 80 端口自动申请并每 12 小时检查续期。
+1. 每 2 分钟向 `install.lemon.vin` 注册或发送心跳；
+2. Tunnel 上报 cloudflared、实际协议和 7844；直连按 IPv4/IPv6 回访公开端口；平台代理回访平台公网入口；
+3. 请求 Worker 从公网回访当前域名的首页及 VLESS/VMess/Trojan WebSocket；
+4. 每 15 秒领取一次面板“立即检测”指令并回传结果。
 
-如果希望直连模式自动维护 Cloudflare DNS，先设置 `CF_DNS_ENABLED=true`，再配置一个只允许目标 Zone 使用的 API Token。默认不会调用 Cloudflare DNS API：
+Tunnel 首次公网回访暂未完成时只显示“正在确认”，连续失败达到阈值后才标记异常，避免刚启动或短暂网络抖动造成误隔离。直连和平台代理则直接显示各自的公网回访结果。
 
-* `CF_DNS_ENABLED`：是否启用 Cloudflare DNS 自动解析，默认 `false`；仅在 `DIRECT_MODE=true` 时生效；
-* `CF_API_TOKEN`：Cloudflare API Token，权限建议为目标 Zone 的 `Zone Read` 和 `DNS Write`；
-* `CF_DNS_ZONE_ID`：可选，填写后不需要自动推断 Zone；
-* `CF_DNS_ZONE_NAME`：可选，复杂后缀域名可以显式填写，例如 `lemon.vin`；
-* `CF_DNS_PUBLIC_IP`：可选，默认通过公网服务自动获取本机 IPv4；
-* `CF_DNS_RECORD_NAME`：可选，默认使用 `ARGO_DOMAIN`；启用 `CF_DNS_ENABLED=true` 时必须与 `ARGO_DOMAIN` 一致；关闭时不生效；
-* `CF_DNS_TTL`：可选，默认 120 秒；
-* `CF_DNS_SYNC_INTERVAL_MS`：可选，默认 300000（5 分钟），公网 IP 变化后的检查间隔，最小 60000；
-* `CF_DNS_REPLACE_CNAME`：可选，默认 `true`，直连切换时自动删除同名 Tunnel CNAME；设置为 `false` 可禁止。
+#### 可选直连模式
 
-同时启用 `DIRECT_MODE=true`、`CF_DNS_ENABLED=true` 并配置 `CF_API_TOKEN` 后，启动时会自动创建或更新 `ARGO_DOMAIN` 的 A 记录，并强制设置为 DNS-only（灰云），避免再次经过 Cloudflare WebSocket 边缘。Token 不会写入日志。
+设置 `DIRECT_MODE=true` 后使用 Nginx 在 `DIRECT_HTTP_PORT`/`DIRECT_PORT`（默认 80/443）接收流量，可挂载 `DIRECT_CERT_FILE`、`DIRECT_KEY_FILE`，或由 `DIRECT_LETSENCRYPT_EMAIL` 配合 Certbot 申请证书。启用 `CF_DNS_ENABLED=true` 时，可用 `CF_API_TOKEN` 自动维护 `ARGO_DOMAIN` 的 DNS-only A 记录。Nginx 会在系统具备 IPv6 时同时监听 IPv4/IPv6，Worker 会分别回访并上报可用地址族。
 
-示例（自动申请 Let's Encrypt 证书）：
+#### 可选平台代理模式
 
-```bash
-docker run -d --name lemon-node --restart unless-stopped \
-  -p 80:80 -p 443:443 \
-  -v /srv/lemon-node/letsencrypt:/etc/letsencrypt \
-  -e DIRECT_MODE=true \
-  -e ARGO_DOMAIN=justrunmy.lemon.vin \
-  -e DIRECT_LETSENCRYPT_EMAIL=you@example.com \
-  -e CF_DNS_ENABLED=true \
-  -e CF_API_TOKEN=你的Cloudflare_DNS_API_Token \
-  -e UUID=你的UUID \
-  ghcr.io/lemonllhon/nodejs:latest
-```
-
-直连模式生成的 VLESS、VMess、Trojan 节点地址统一为 `ARGO_DOMAIN:DIRECT_PORT`，其中 `DIRECT_PORT` 默认是 443，`DIRECT_HTTP_PORT` 默认是 80。原有 Cloudflare Tunnel 模式保持不变。
-
-#### 公网 80/443 可访问时自动申请证书
-
-如果 Docker 主机拥有真正可入站的公网 IP，并且防火墙、云安全组和端口映射均已放行 TCP 80、443，可以使用直连模式自动申请和续期 Let's Encrypt 证书：
-
-```bash
-docker run -d --name lemon-node --restart unless-stopped \
-  -p 80:80 -p 443:443 \
-  -v /srv/lemon-node/letsencrypt:/etc/letsencrypt \
-  -e DIRECT_MODE=true \
-  -e ARGO_DOMAIN=node.example.com \
-  -e DIRECT_LETSENCRYPT_EMAIL=admin@example.com \
-  -e CF_DNS_ENABLED=false \
-  -e UUID=你的UUID \
-  ghcr.io/lemonllhon/nodejs:latest
-```
-
-使用前请确认：
-
-* `ARGO_DOMAIN` 的 A/AAAA 记录已解析到该 Docker 主机的公网 IP；
-* 外部访问 `http://ARGO_DOMAIN/.well-known/acme-challenge/` 可以到达容器的 80 端口；
-* 443 端口未被其他服务占用；
-* `DIRECT_LETSENCRYPT_EMAIL` 只是 Let's Encrypt 证书通知和续期邮箱，不是 Cloudflare 或 cloudflared 邮箱；
-* 直连模式不需要 `ARGO_AUTH`、`ARGO_PORT`、`CFIP` 或 `CF_API_TOKEN`。
-
-证书申请成功后，容器使用 Nginx 在 443 接收 HTTPS/WebSocket，并将三个协议路径转发给 Xray。证书会保存到 `/etc/letsencrypt`，建议保留挂载卷以便容器重建后继续使用；容器每 12 小时检查一次证书续期。
-
-如果希望程序自动维护 Cloudflare DNS，将 DNS 记录切换为 DNS-only，可以改为：
-
-```bash
--e CF_DNS_ENABLED=true \
--e CF_DNS_RECORD_NAME=node.example.com \
--e CF_API_TOKEN=你的Cloudflare_DNS_API_Token
-```
-
-此时 `CF_DNS_RECORD_NAME` 必须与 `ARGO_DOMAIN` 完全一致，API Token 只需要目标 Zone 的 `Zone Read` 和 `DNS Write` 权限。若主机处于 NAT、平台随机端口转发或无法从公网访问 80/443，请使用上面的平台代理模式，不要使用直连证书模式。
-
-### 平台边缘代理模式（Railway 等平台）
-
-如果部署平台可以提供 HTTPS 域名，并将域名的 443 请求转发到容器的非标准端口，可以设置 `PLATFORM_PROXY_MODE=true`。此模式复用 `ARGO_PORT` 作为容器唯一入口：Xray 在该端口接收普通 HTTP/WebSocket 请求，平台边缘负责公网 HTTPS、证书和转发，容器不会启动 Cloudflare Tunnel、Nginx 或 Certbot。
-
-此模式下，`ARGO_DOMAIN` 应填写平台分配的域名或已经绑定到平台的自定义域名，平台的 Target Port 选择与 `ARGO_PORT` 相同的端口（例如 8001）。生成的节点仍然使用公网 `ARGO_DOMAIN:PLATFORM_PUBLIC_PORT`、TLS 和 WebSocket；TLS 只在平台边缘终止，容器内部不需要证书。`CF_API_TOKEN`、`CFIP`、`CFPORT`、`DIRECT_MODE` 和 `ARGO_AUTH` 在此模式下不需要配置。
-
-示例（容器使用 8001，平台外部使用 HTTPS 443）：
-
-```bash
-docker run -d --name lemon-node --restart unless-stopped \
-  -p 8001:8001 \
-  -e PLATFORM_PROXY_MODE=true \
-  -e ARGO_PORT=8001 \
-  -e SERVER_PORT=3000 \
-  -e PLATFORM_PUBLIC_PORT=443 \
-  -e ARGO_DOMAIN=your-service.up.railway.app \
-  -e UUID=你的UUID \
-  ghcr.io/lemonllhon/nodejs:latest
-```
-
-平台代理模式环境变量（Cloudflare DNS 默认关闭）：
-
-```json
-{
-  "PLATFORM_PROXY_MODE": "true",
-  "CF_DNS_ENABLED": "false",
-  "ARGO_PORT": "8001",
-  "SERVER_PORT": "3000",
-  "PLATFORM_PUBLIC_PORT": "443",
-  "NAME": "<NAME>",
-  "UUID": "<UUID>",
-  "TEAMNODE_SYNC_BASE_URL": "https://install.lemon.vin",
-  "TEAMNODE_SYNC_ENROLL_PASSWORD": "<TEAMNODE_SYNC_ENROLL_PASSWORD>"
-}
-```
-
-在 Railway 中可以不填写 `ARGO_DOMAIN`：程序会自动使用 Railway 提供的 `RAILWAY_PUBLIC_DOMAIN`。其他平台如果提供 `PLATFORM_PUBLIC_DOMAIN`、`BOXD_PUBLIC_DOMAIN` 或 `PUBLIC_DOMAIN`，程序也会自动使用；如果平台没有提供公网域名环境变量，则仍需填写 `ARGO_DOMAIN`。boxd 当前验证域名为 `lemonboxd.boxd.sh`。
-
-在 Railway、boxd 等平台中，将平台 HTTPS Proxy 的 Target Port 指向 `ARGO_PORT`（例如 8001）。平台负责外部 HTTPS 443 和证书，容器不申请证书，也不启动 Cloudflare Tunnel。`CF_DNS_RECORD_NAME`、`CF_API_TOKEN`、`CFIP`、`CFPORT`、`ARGO_AUTH` 在 `CF_DNS_ENABLED=false` 的平台代理模式下无需配置。
-
-如果使用自定义域名，需要先在平台完成域名绑定，再将该域名填写为 `ARGO_DOMAIN`。如果域名仍由 Cloudflare 托管，建议使用 DNS-only，避免再次经过 Cloudflare 的 WebSocket 边缘处理。
+设置 `PLATFORM_PROXY_MODE=true` 后，平台负责公网 HTTPS 和证书，容器通过 `ARGO_PORT` 接收平台转发；`PLATFORM_PUBLIC_DOMAIN` 和 `PLATFORM_PUBLIC_PORT` 用于生成并验证公网路线。该模式不启动 cloudflared、Nginx 或 Certbot。
 
 ### Docker 镜像中的 cloudflared 自动更新
 
@@ -151,7 +54,7 @@ Docker 镜像继续由 Dockerfile 根据 `TARGETARCH` 安装对应的 cloudflare
 
 ### 运行日志
 
-Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`；由 Node.js 进程管理器捕获的标准输出和启动错误分别写入 `xray-process.log`、`cloudflared-process.log`，直连模式下 Nginx 的进程日志写入 `nginx-process.log`。临时 Tunnel 的域名发现日志保留在 `boot.log`，不会在运行期间被定时删除。生产环境默认关闭 Xray access log，排障时再临时打开，避免每个连接产生额外磁盘 I/O。
+Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-access.log`、`xray-error.log` 和 `cloudflared.log`；由 Node.js 进程管理器捕获的标准输出和启动错误分别写入 `xray-process.log`、`cloudflared-process.log`，直连时 Nginx 日志写入 `nginx-process.log`。临时 Tunnel 的域名发现日志保留在 `boot.log`，不会在运行期间被定时删除。生产环境默认关闭 Xray access log，排障时再临时打开，避免每个连接产生额外磁盘 I/O。
 
 ### 进程托管与后台运行
 
@@ -170,7 +73,6 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 
 - VLESS、VMess、Trojan 目前都通过 WebSocket 入口工作；通常优先使用 VLESS，协议开销更低，其他两个保留用于客户端兼容性。
 - WebSocket 节点默认关闭 Xray sniffing，因为本项目只需要按路径分流，不需要透明代理域名识别。若依赖域名路由或透明代理，再设置 `XRAY_SNIFFING_ENABLED=true`。
-- 直连模式已提高 Nginx worker、连接数和长连接转发参数，并关闭代理缓冲，适合持续 WebSocket 流量。
 - Tunnel 模式可用 `CLOUDFLARED_PROTOCOL=quic` 做 A/B 测试；默认仍为 `http2`，如果握手失败、丢包或吞吐下降就恢复 `http2`。协议选择受网络到 Cloudflare 边缘的路径影响，不保证 QUIC 一定更快。
 - `ed=2560` 已用于生成的 WebSocket 节点链接，不建议盲目增大；更换 XHTTP、gRPC 或 REALITY 会改变客户端链接格式，应单独做兼容性测试。
 
@@ -195,25 +97,25 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | XRAY_SNIFFING_ENABLED | 否 | false | 是否启用 WebSocket 流量嗅探；需要透明代理/域名路由时开启 |
 | CLOUDFLARED_LOG_LEVEL | 否 | info | cloudflared 日志级别 |
 | CLOUDFLARED_PROTOCOL | 否 | http2 | Tunnel 传输协议：`auto`、`http2` 或 `quic`；`quic` 建议先做 A/B 测试 |
-| DIRECT_NGINX_ACCESS_LOG_ENABLED | 否 | false | 直连模式是否写入 Nginx access log；生产建议关闭，排障时开启 |
-| DIRECT_MODE | 否 | false | 是否启用直连模式；启用后不启动 cloudflared |
+| DIRECT_MODE | 否 | false | 显式启用直连；不会由 Tunnel 自动切换 |
 | DIRECT_PORT | 否 | 443 | 直连 HTTPS 和节点端口 |
-| DIRECT_HTTP_PORT | 否 | 80 | 直连 HTTP 端口，用于 ACME 验证和跳转 |
-| DIRECT_CERT_FILE | 直连模式二选一 | - | 已有 TLS 证书路径，需与 `DIRECT_KEY_FILE` 同时配置 |
-| DIRECT_KEY_FILE | 直连模式二选一 | - | 已有 TLS 私钥路径，需与 `DIRECT_CERT_FILE` 同时配置 |
-| DIRECT_LETSENCRYPT_EMAIL | 直连模式二选一 | admin@lemon.vin | Let's Encrypt 邮箱；可覆盖默认值，与上面证书路径二选一 |
-| PLATFORM_PROXY_MODE | 否 | false | 是否启用平台边缘代理模式；启用后复用 `ARGO_PORT`，不启动 cloudflared、Nginx 或 Certbot |
-| PLATFORM_PUBLIC_DOMAIN | 平台代理模式可选 | 自动读取平台变量 | 平台公网域名覆盖值；也会自动读取 `RAILWAY_PUBLIC_DOMAIN`、`BOXD_PUBLIC_DOMAIN` 或 `PUBLIC_DOMAIN` |
-| PLATFORM_PUBLIC_PORT | 平台代理模式可选 | 443 | 平台外部 HTTPS 端口，仅用于生成节点链接，容器入口仍使用 `ARGO_PORT` |
-| CF_DNS_ENABLED | 否 | false | 是否启用直连模式 Cloudflare DNS 自动解析；默认不调用 Cloudflare DNS API |
-| CF_API_TOKEN | 否 | - | 启用 `CF_DNS_ENABLED=true` 后使用的 Cloudflare DNS API Token，需 Zone Read + DNS Write |
+| DIRECT_HTTP_PORT | 否 | 80 | 直连 HTTP、ACME 验证和跳转端口 |
+| DIRECT_CERT_FILE | 否 | - | 已有 TLS 证书路径，需与 `DIRECT_KEY_FILE` 同时设置 |
+| DIRECT_KEY_FILE | 否 | - | 已有 TLS 私钥路径 |
+| DIRECT_LETSENCRYPT_EMAIL | 否 | admin@lemon.vin | 未挂载证书时的 Let's Encrypt 邮箱 |
+| DIRECT_NGINX_ACCESS_LOG_ENABLED | 否 | false | 是否记录直连 Nginx access log |
+| PLATFORM_PROXY_MODE | 否 | false | 显式启用平台代理模式 |
+| PLATFORM_PUBLIC_DOMAIN | 否 | 自动读取平台变量 | 平台公网域名 |
+| PLATFORM_PUBLIC_PORT | 否 | 443 | 平台公网 HTTPS 端口 |
+| CF_DNS_ENABLED | 否 | false | 直连时是否自动维护 Cloudflare DNS |
+| CF_API_TOKEN | 否 | - | DNS API Token，建议仅授予目标 Zone Read/DNS Write |
 | CF_DNS_ZONE_ID | 否 | 自动推断 | Cloudflare Zone ID |
-| CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称，复杂域名后缀时填写 |
-| CF_DNS_RECORD_NAME | 否 | ARGO_DOMAIN | 自动维护的 A 记录名称；启用 DNS 同步时必须与 `ARGO_DOMAIN` 一致，关闭时不生效 |
-| CF_DNS_PUBLIC_IP | 否 | 自动获取 | 指定要写入 DNS 的公网 IPv4 |
-| CF_DNS_TTL | 否 | 120 | DNS TTL 秒数，范围 1-86400 |
-| CF_DNS_SYNC_INTERVAL_MS | 否 | 300000 | 自动解析检查间隔，最小 60000 毫秒 |
-| CF_DNS_REPLACE_CNAME | 否 | true | 是否自动替换同名 Cloudflare Tunnel CNAME |
+| CF_DNS_ZONE_NAME | 否 | 自动推断 | Cloudflare Zone 名称 |
+| CF_DNS_RECORD_NAME | 否 | ARGO_DOMAIN | 自动维护的 A 记录名称 |
+| CF_DNS_PUBLIC_IP | 否 | 自动获取 | 指定直连公网 IPv4 |
+| CF_DNS_TTL | 否 | 120 | DNS TTL 秒数 |
+| CF_DNS_SYNC_INTERVAL_MS | 否 | 300000 | DNS 检查间隔（毫秒） |
+| CF_DNS_REPLACE_CNAME | 否 | true | 是否替换同名 Tunnel CNAME |
 | NAME | 否 | Vls | 节点名称前缀 |
 | FILE_PATH | 否 | ./tmp | 运行目录 |
 | SUB_PATH | 否 | sub | 订阅路径 |
@@ -229,15 +131,15 @@ Xray 和 cloudflared 的运行日志会写入 `FILE_PATH` 目录下的 `xray-acc
 | TEAMNODE_SYNC_PROVIDER | 否 | 自动生成 | TeamNode 节点供应商标识，默认按国家/地区缩写自动生成，如 `us`、`sin` |
 | TEAMNODE_SYNC_LABEL_PREFIX | 否 | 空 | TeamNode 节点标签前缀，默认直接使用国家名作为节点名称 |
 | TEAMNODE_SYNC_TIMEOUT_MS | 否 | 10000 | TeamNode 同步请求超时 |
-| TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS | 否 | 300000 | TeamNode 心跳间隔（毫秒） |
+| TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS | 否 | 120000 | TeamNode 心跳间隔（毫秒）；应明显短于 Worker 超时阈值 |
 | TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT | 否 | true | 是否在每次心跳中携带最新 `contentBase64` |
+| TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS | 否 | 15000 | 轮询面板“立即检测”命令的间隔（毫秒，最小 5000） |
 
 未设置 `UUID` 时，程序会在每次 Node.js 进程启动时生成一个新的 UUID v4，并将同一个值用于 Xray、三种协议订阅以及 Worker 注册/心跳。需要在容器重启后保持节点身份不变时，请显式设置 `UUID`，并持久化该环境变量。
 
 ## 🌐 订阅地址
 
 - 标准端口：`https://your-domain.com/sub`
-- 非标端口：`http://your-domain.com:port/sub`
 
 ## TeamNode 同步
 
