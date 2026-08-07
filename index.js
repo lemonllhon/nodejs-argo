@@ -68,9 +68,9 @@ const CF_DNS_PUBLIC_IP = process.env.CF_DNS_PUBLIC_IP || "";
 const CF_DNS_TTL = Number.parseInt(process.env.CF_DNS_TTL || "120", 10);
 const CF_DNS_SYNC_INTERVAL_MS = Number.parseInt(process.env.CF_DNS_SYNC_INTERVAL_MS || "300000", 10);
 const CF_DNS_REPLACE_CNAME = parseBoolean(process.env.CF_DNS_REPLACE_CNAME, true);
-const CFIP = process.env.CFIP || ((DIRECT_MODE || PLATFORM_PROXY_MODE) ? ARGO_DOMAIN : "www.cloudflare.com"); // 节点优选域名或优选 IP
+const CFIP = process.env.CFIP || ((DIRECT_MODE || PLATFORM_PROXY_MODE) ? ARGO_DOMAIN : "cdst.lemon.vin"); // 节点优选域名或优选 IP
 const CFPORT = process.env.CFPORT || (DIRECT_MODE ? DIRECT_PORT : PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_PORT : 443); // 节点端口
-const NAME = process.env.NAME || ""; // 节点名称前缀
+const NAME = process.env.NAME || "lemon"; // 节点名称前缀
 const NODE_TIMEZONE = process.env.NODE_TIMEZONE || (() => {
   try {
     return new Intl.DateTimeFormat().resolvedOptions().timeZone || "";
